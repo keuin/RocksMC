@@ -1,0 +1,24 @@
+out/
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Build output
+build/
+.gradle/
+bin/
+
+# Loom / Fabric
+.fabric/
+remappedSrc/
+run/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
