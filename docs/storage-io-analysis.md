@@ -150,17 +150,40 @@ handles large values natively.
 
 | Engine | Verdict | Reason |
 |---|---|---|
-| **RocksDB** | ✅ Viable | LSM KV, point lookups, key-value separation, checkpoints, maintained `rocksdbjni` with prebuilt natives |
-| WiredTiger | ⚠️ Workable | Right shape, first-class checkpoints. But no maintained Maven artifact with natives — you own multi-platform packaging indefinitely. No evidence of ZSTD trained-dictionary support |
+| **RocksDB** | ✅ Recommended | LSM KV, point lookups, key-value separation, checkpoints, maintained `rocksdbjni` with prebuilt natives, Apache-2.0 |
+| **WiredTiger** | ⚠️ **Technically better, rejected on licence/packaging** | **Measured: 15.7% better compression ratio and bytes written within 1.06×** (Phase 0c). Loses on GPL2/GPL3-only licence, no prebuilt Java artifact, and three build patches needed on GCC 16 |
+| **Redis + AOF** | ❌ | Redundant second copy of data already heap-resident; IPC per read; AOF-rewrite forks stall the tick loop. See §5.4 |
+| LMDB | ⚠️ Interesting, not evaluated | mmap reads are extremely fast and MVCC snapshots are excellent, but copy-on-write means random writes and there is **no built-in compression** — a hard loss given a measured 4.8–5.7× ratio |
 | TiKV | ❌ | Distributed, Raft-replicated, network RTT per point read. The tick loop needs sub-ms chunk reads |
 | ClickHouse | ❌❌ | Columnar OLAP. `loadChunk` is a single-key point read (`ThreadedAnvilChunkStorage.java:455-459`); MergeTree has no efficient single-row update, and every chunk save is a whole-value overwrite |
 
-On the RocksDB-vs-WiredTiger write-amplification question specifically: the
-intuition that LSM compaction repeatedly rewrites multi-KiB values is **correct**,
-and measured — 32.8 MB of compaction traffic with values in the LSM. But
-key-value separation reduces that to **233 KB** for identical logical writes, a
-140× difference. The write-amp objection to RocksDB does not survive contact with
-BlobDB. See `spike/phase0-blob-dict/FINDINGS.md`.
+### The WiredTiger question, and a retracted argument
+
+Two objections were originally raised against WiredTiger. **One of them was
+wrong, and it is worth recording which.**
+
+*Retracted:* "WiredTiger probably lacks ZSTD trained-dictionary support, so it
+forfeits cross-chunk compression." Phase 0 showed RocksDB's **blob files ignore
+dictionaries too**, and Phase 0c showed WiredTiger's `dictionary=` setting is
+per-page value dedup, not trained dictionaries — output was byte-identical with
+it on and off. **Neither engine offers true cross-value dictionary compression.**
+The objection discriminated nothing.
+
+*Survived:* packaging and licensing. WiredTiger is GPL2/GPL3/Commercial, has no
+maintained Maven artifact with prebuilt natives, needed three patches to compile
+on GCC 16, and — most dangerously — its PyPI distribution ships **no compressor
+extensions at all**, silently producing an *uncompressed* database measuring
+0.86×, i.e. larger than its input.
+
+On the write-amplification hypothesis specifically: the prediction that a B-tree's
+in-place page updates would cost far more bytes than key-value separation **did
+not survive measurement** — 1.06×, not the expected multiple. The reason is
+visible in RocksDB's own numbers: with BlobDB, compaction accounts for 233 KB out
+of 134.6 MB total, or 0.17%. Nearly all write volume is *flush*, which both
+engines must do. Key-value separation was defending against a cost that barely
+exists at this value size and write rate.
+
+Full data: `spike/phase0c-wiredtiger/FINDINGS.md`.
 
 ## 5. Engine swap: benefit
 
@@ -180,21 +203,27 @@ amplification matters here only for *flash endurance* over multi-year deployment
 
 ### 5.2 What genuinely improves
 
-- **Consistent snapshots of a live world.** RocksDB checkpoints are hard-link
-  based and near-instant, with no server pause. **Anvil has no equivalent** —
-  safe backup requires flush-and-pause. This is the strongest argument for the
-  swap, and it is an operational argument, not a performance one.
 - **Atomic cross-subsystem commits.** Today chunk and POI data live in separate
   `StorageIoWorker` instances over separate directories
   (`VersionedChunkStorage.java:26` vs `SerializingRegionBasedStorage.java:50`), so
   `ThreadedAnvilChunkStorage.save()` (`:625,648`) *cannot* commit them together.
-  A single `WriteBatch` across column families fixes that.
+  A single `WriteBatch` across column families fixes that. **This is the pillar
+  with no filesystem-level substitute**, and after the corrections in §5.5 it is
+  the strongest remaining argument for the swap.
+- **Recoverable snapshots.** RocksDB checkpoints are hard-link based and
+  near-instant with no pause. But see §5.5: copy-on-write filesystems already
+  provide instant snapshots, so the real gain is *recoverability*, not capability.
 - **Checksummed WAL** replacing crash-safety-by-write-ordering, and elimination of
   the torn-header blast radius (§3.1).
 - **Bounded space amplification** replacing never-compacted fragmentation (§3.2).
 - **Collapsing many tiny files.** `PersistentStateManager` allocates one `.dat`
   per saved-data type (`:32,121`), including one per in-game map
   (`ServerWorld.java:1205-1210`). Long-lived worlds accumulate thousands.
+- **No per-read throwaway allocation.** Every chunk read allocates a fresh,
+  sector-*rounded* heap buffer — `ByteBuffer.allocate(k * 4096)`
+  (`RegionFile.java:106-108`) — which is then wrapped via `buffer.array()`
+  (`:170-172`). Never pooled, never direct. Minor, but it is GC pressure directly
+  on the chunk-load path.
 
 ### 5.3 The compression question, resolved by measurement
 
@@ -212,27 +241,126 @@ cannot see any of it:
   dictionary facility is entirely unused
 
 This made shared-dictionary compression the most attractive part of the design.
-**Measurement killed it for chunk data:** RocksDB blob files ignore trained
-dictionaries (byte-identical output with dictionaries on and off), and keeping
-values in the LSM to regain dictionary scope costs 140× compaction traffic for a
-2.3% size win.
+**Measurement killed that specific mechanism on both engines:** RocksDB blob files
+ignore trained dictionaries (byte-identical output with them on and off), keeping
+values in the LSM instead costs 140× compaction traffic for a 2.3% size win, and
+WiredTiger's `dictionary=` turned out to be per-page value dedup rather than
+trained dictionaries — also byte-identical on and off.
 
-What survives: **DEFLATE → ZSTD** is a real CPU and modest ratio improvement. But
-`ChunkStreamVersion` already versions compression per chunk (`:16-18`), so vanilla
-could adopt ZSTD *inside* `.mca` and capture that win with **no engine change and
-full format compatibility**.
+What *does* recover cross-value scope is **page packing**: WiredTiger compressing
+whole leaf pages containing many values measured **5.65×**, against BlobDB's
+per-blob **4.76×** — a 15.7% edge (Phase 0c). So the scope argument was correct in
+principle; it simply arrives via page size rather than dictionaries, and the
+magnitude is modest.
+
+What survives regardless of engine: **DEFLATE → ZSTD** is a real CPU and ratio
+improvement. But `ChunkStreamVersion` already versions compression per chunk
+(`:16-18`), so vanilla could adopt ZSTD *inside* `.mca` and capture that with **no
+engine change and full format compatibility**.
+
+### 5.4 Why not an in-memory store
+
+A natural proposal is: hold the whole map in RAM (Redis, or similar) and persist
+via an append-only log. The reasoning behind it is sound — append-only sequential
+writes are a genuinely good fit for cheap storage — but it does not survive contact
+with how the server actually works.
+
+**Loaded chunks are already resident in the JVM heap as deserialized objects.**
+`ThreadedAnvilChunkStorage.currentChunkHolders` is a
+`Long2ObjectLinkedOpenHashMap<ChunkHolder>` (`:96-98`), fronted by a four-entry
+direct cache in `ServerChunkManager` (`chunkCache = new Chunk[4]`, `:60-62`).
+
+The consequence is decisive: the hot path — block reads and writes, entity
+ticking, redstone — **never touches storage at all.** It operates on
+`PalettedContainer` objects in heap. Storage is consulted only on two cold events:
+chunk load (a player walks into new terrain) and chunk save
+(autosave or unload).
+
+So an in-memory store would:
+
+1. **Pay for a second copy** of data that is either already in heap (the working
+   set) or, by definition, not currently being touched (everything else).
+2. **Lose to the OS page cache, which already does this for free.** If there is
+   enough RAM to hold the map, Linux caches the `.mca` files and
+   `channel.read` (`RegionFile.java:108`) becomes a memcpy from page cache. No
+   IPC, no second copy, no configuration.
+3. **Make reads slower.** Every chunk load becomes serialize → socket → context
+   switch → lookup → response → deserialize. Even over a unix socket that is tens
+   of microseconds plus a cross-process dependency, against a page-cache hit in
+   single-digit microseconds.
+4. **Introduce fork stalls.** With a large resident set, periodic AOF rewrite
+   forks incur page-table copying and copy-on-write faults, landing latency spikes
+   on the tick loop.
+5. **Regress durability.** `appendfsync everysec` risks ~1 s of loss; `always`
+   means an fsync per write. Vanilla's `O_DSYNC` (`RegionFile.java:55`, default
+   on) loses nothing.
+
+The useful insight inside the proposal — *make the write path sequential* — is
+real, and RocksDB's WAL already provides it: in-process, sequential append, no
+second copy, no fork stalls, with group commit available.
+
+### 5.5 Filesystem snapshots vs engine checkpoints
+
+An earlier draft of this analysis claimed Anvil "has no equivalent" to consistent
+online snapshots. **That was an overstatement and is corrected here.**
+
+Copy-on-write filesystems (btrfs, ZFS) and LVM thin volumes provide instant
+snapshots with no application involvement and no pause. If the world lives on
+btrfs, most of the snapshot benefit is available today, for zero engineering.
+
+The distinction that actually matters is *what kind* of consistency:
+
+| Approach | Snapshot cost | Consistency |
+|---|---|---|
+| btrfs/ZFS + **Anvil** | Instant, no pause | **Crash-consistent only.** May capture a torn 8 KiB header mid-rewrite (`RegionFile.java:298-301`). Anvil has **no WAL**, so such damage is unrecoverable *and silent* |
+| btrfs/ZFS + **RocksDB** | Instant, no pause | Crash-consistent, but the **checksummed WAL makes it recoverable** — replay reconstructs a valid state |
+| **RocksDB checkpoint** | Hard-link, no pause | **Application-consistent** by construction; no torn state possible |
+
+So the honest position: a filesystem snapshot of an Anvil world is *probably*
+fine and *occasionally* silently corrupt, with no mechanism to detect or repair
+it. A filesystem snapshot of a RocksDB world is recoverable, and an engine
+checkpoint is consistent by design.
+
+That is a real improvement, but a much narrower one than "Anvil cannot do this."
+Anyone with btrfs or ZFS already available should weigh the remaining delta
+honestly before adopting a new storage engine for snapshot reasons alone.
+
+### 5.6 Rotational storage (secondary observation)
+
+Not a primary consideration for SSD deployments, but worth recording as a genuine
+Anvil weakness: the write path is close to worst-case for a spinning disk.
+
+Per chunk write (`RegionFile.java:246-277`): first-fit sector allocation scattered
+across the file, a positioned write at `offset * 4096`, then a **full 8 KiB header
+rewrite at offset 0** — a mandatory seek back to the start of the file — all under
+`O_DSYNC`. That is roughly two seeks plus a synchronous flush for every chunk
+saved.
+
+A log-structured engine converts this to sequential appends. If rotational storage
+were a target, that alone would justify the change; on SSD it is largely moot.
+
 
 ## 6. Conclusion
 
 **Feasible: yes.** The seam is 444 LOC and already blob-KV shaped.
 
-**Beneficial: only for operational reasons.** Specifically: live consistent
-snapshots, atomic cross-subsystem commits, checksummed WAL, bounded space
-amplification. None of these are obtainable from Anvil at any amount of tuning.
+**Beneficial: narrowly, and for one reason.** After measurement, the four original
+justifications did not fare equally:
 
-**Not beneficial for performance.** The read path regresses from optimal, write
-amplification improves marginally at best, and absolute write volume is so low
-that none of it matters. The three genuine performance wins —
+| Justification | Status |
+|---|---|
+| Cross-chunk compression via dictionaries | ❌ **Dead.** Neither RocksDB blob files nor WiredTiger's `dictionary=` provide trained dictionaries; the LSM alternative costs 140× compaction for 2.3% |
+| Sequential writes for rotational storage | ⚠️ **Real but situational** (§5.6); moot on SSD |
+| Consistent live snapshots | ⚠️ **Weakened.** Copy-on-write filesystems already give instant snapshots; the true gain is *recoverability* (§5.5) |
+| Atomic cross-subsystem commits | ✅ **Intact.** Chunk and POI genuinely cannot be committed together today, and no filesystem feature substitutes for it |
+
+Still true, and not addressed by any filesystem: the torn-header blast radius
+across 1023 siblings (§3.1), never-compacted fragmentation (§3.2), thousands of
+tiny `.dat` files, and per-read throwaway allocation (§5.2).
+
+**Not beneficial for performance.** The read path regresses from an already
+optimal O(1), write amplification improves marginally at best, and absolute write
+volume is so low that none of it matters. The three genuine performance wins —
 
 1. ZSTD instead of DEFLATE (`ChunkStreamVersion.java:17`)
 2. group-commit instead of `O_DSYNC` per write (`RegionFile.java:55`)
@@ -242,9 +370,18 @@ that none of it matters. The three genuine performance wins —
 effort, preserving `.mca` compatibility with the entire third-party ecosystem
 (Amulet, Chunker, BlueMap/Dynmap, pregenerators, world editors).
 
-Anyone whose motivation is "the vanilla server is slow" should do those three
-things and stop. Anyone who needs to back up a running world without pausing it
-has no option within Anvil, and that is the case this project exists to serve.
+**Recommendation.** Anyone whose motivation is "the vanilla server is slow" should
+do those three things and stop. Anyone who needs atomic multi-subsystem commits,
+or recoverable rather than merely crash-consistent backups, has a real case — but
+should weigh it against a permanent `.mca` converter obligation, a native
+dependency, and a read path that gets worse.
+
+On engine choice: **WiredTiger measured better than RocksDB** on this workload
+(15.7% better ratio, bytes written within 1.06×). RocksDB remains the
+recommendation on licensing (Apache-2.0 vs GPL-only) and packaging (prebuilt Maven
+natives vs three build patches and a silent no-compression failure mode) — not on
+technical merit. That distinction is worth stating plainly rather than
+retrofitting a technical justification onto a practical decision.
 
 ## 7. Caveats
 
@@ -253,5 +390,22 @@ has no option within Anvil, and that is the case this project exists to serve.
   of scope.
 - Compression and amplification measurements used **synthetic** corpora modelling
   chunk redundancy. Real-world magnitudes are unknown.
-- Single RocksDB version (10.10.1), single machine, no repetitions. Size figures
-  are deterministic under a fixed seed; timing was not measured at all.
+- Single engine versions (RocksDB 10.10.1, WiredTiger 11.3.1), single machine, no
+  repetitions. Size figures are deterministic under a fixed seed; timing was not
+  measured at all.
+- **The two engine harnesses are written in different languages** (Java/RocksDB,
+  Python/WiredTiger). Corpora are byte-identical — Java's `Random` LCG was
+  reimplemented exactly — but flush and checkpoint semantics are only
+  *approximately* aligned, and the two engines' write-bytes statistics are not
+  guaranteed to count identical things. The 1.06× bytes-written comparison should
+  be read as "same order of magnitude", not a precise ratio.
+- One unexplained result: WiredTiger's on-disk size after 12 overwrite rounds was
+  2.1× RocksDB's, the opposite of its Experiment 1 advantage. Probably checkpoint
+  retention or free-space fragmentation rather than steady-state size, but it was
+  not investigated.
+- Two harness bugs were found and corrected during this work (double-counted blob
+  bytes; an impossible sub-1.0× write-amplification figure from dividing
+  compressed by uncompressed bytes), and one unfair comparison was caught before
+  publication (WiredTiger *total* bytes against RocksDB *compaction-only* bytes).
+  Both spike FINDINGS files document them. Treat any remaining single-source
+  number here with corresponding suspicion.
