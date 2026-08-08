@@ -22,3 +22,7 @@ run/
 
 # OS
 .DS_Store
+
+# Real chunk corpora and generated worlds are Mojang-derived data.
+corpus.bin
+test-world/
