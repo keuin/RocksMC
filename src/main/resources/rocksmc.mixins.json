@@ -1,0 +1,11 @@
+{
+	"required": true,
+	"package": "com.keuin.rocksmc.mixin",
+	"compatibilityLevel": "JAVA_8",
+	"server": [
+		"RegionBasedStorageMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

@@ -1,0 +1,122 @@
+plugins {
+    id 'fabric-loom' version '1.17.19'
+}
+
+base.archivesName = project.archives_base_name
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+}
+
+loom {
+    // Only the dedicated server matters here; the client is out of scope.
+    serverOnlyMinecraftJar()
+
+    // Loom defaults the forked decompiler worker to a 4 GiB heap with one
+    // Vineflower thread per CPU core. On a high-core machine those threads
+    // exhaust the heap and the workers die with OutOfMemoryError.
+    decompilers {
+        vineflower {
+            memory = 12288L
+            maxThreads = 8
+        }
+    }
+
+    runs {
+        server {
+            server()
+            // The fidelity harness runs inside a real server so it exercises the
+            // genuine chunk load/save path rather than a synthetic driver.
+            runDir = 'run/server'
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // RocksDB ships platform natives inside the jar, so it must be bundled into
+    // the mod rather than merely compiled against.
+    implementation include("org.rocksdb:rocksdbjni:${project.rocksdb_version}")
+}
+
+// 1.16.5 targets Java 8. Compile to 8 so the mod loads on the same JVMs the
+// game supports, even though Gradle itself runs on 21.
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 8
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+}
+
+// The 1.16.5 server jar predates Mojang's bundler, so shaded libraries share the
+// jar with Minecraft's classes. Loom's incremental decompile cache pairs inner to
+// outer classes by name prefix and crashes on those entries, so disable it.
+tasks.withType(net.fabricmc.loom.task.GenerateSourcesTask).configureEach {
+    useCache = false
+}
+
+jar {
+    from('LICENSE') {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fidelity: round-trip real .mca chunks through RocksDB and verify NBT equality.
+//
+// Runs outside the game against any world directory, including real server
+// backups. Region files are opened read-only; all writes go to a scratch
+// database in a temp dir that is deleted afterwards.
+//
+//   ./gradlew fidelity -Pworld=/path/to/world [-Plimit=5000] [-Pkeep]
+// ---------------------------------------------------------------------------
+tasks.register('fidelity', JavaExec) {
+    group = 'verification'
+    description = 'Round-trip a world through RocksDB and verify chunk NBT fidelity.'
+    dependsOn 'classes'
+
+    // Needs the Minecraft classes (for NBT) plus rocksdbjni, in named mappings.
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.keuin.rocksmc.FidelityMain'
+
+    // Real worlds can be large; give the harness room and let it fail loudly.
+    maxHeapSize = '4G'
+
+    doFirst {
+        if (!project.hasProperty('world')) {
+            throw new GradleException(
+                "Specify the world: ./gradlew fidelity -Pworld=/path/to/world")
+        }
+        def argv = [project.property('world').toString()]
+        if (project.hasProperty('limit')) {
+            argv << '--limit' << project.property('limit').toString()
+        }
+        if (project.hasProperty('keep')) {
+            argv << '--keep'
+        }
+        args = argv
+    }
+}
