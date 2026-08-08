@@ -176,6 +176,22 @@ public final class RocksChunkStore implements ChunkStore {
     }
 
     /**
+     * Compacts the whole keyspace, merging L0 files and collecting obsolete blobs.
+     *
+     * <p>Not something the server needs -- RocksDB compacts in the background --
+     * but measurement harnesses must call it before sizing the database. Without
+     * it, un-merged L0 files and unreferenced blobs remain on disk and inflate the
+     * apparent footprint.
+     */
+    public void compact() throws IOException {
+        try {
+            this.db.compactRange();
+        } catch (RocksDBException e) {
+            throw new IOException("RocksDB compaction failed", e);
+        }
+    }
+
+    /**
      * Creates a consistent, application-level snapshot via hard links.
      *
      * <p>This is the capability Anvil cannot offer at all. A filesystem snapshot

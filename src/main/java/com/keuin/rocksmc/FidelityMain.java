@@ -98,6 +98,7 @@ public final class FidelityMain {
                 total.mismatches += stats.mismatches;
                 total.readFailures += stats.readFailures;
                 total.compressedBytes += stats.compressedBytes;
+                total.anvilOnDisk += stats.anvilOnDisk;
                 total.uncompressedBytes += stats.uncompressedBytes;
                 total.rocksOnDisk += stats.rocksOnDisk;
             } finally {

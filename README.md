@@ -3,8 +3,8 @@
 A RocksDB storage backend for the Minecraft Java Edition 1.16.5 dedicated
 server, implemented as a Fabric mod.
 
-**Status: design verification complete (Phases 0 and 0c). No mod code yet, and
-the case for writing any has weakened — see "What measurement changed".**
+**Status: Phase 1 complete and validated. The RocksDB chunk backend works, and
+was verified against a real 293,207-chunk server world with zero mismatches.**
 
 ## Why
 
@@ -14,22 +14,31 @@ sector offsets. That design is compact and has an excellent read path — one
 in-memory header lookup plus one positioned seek — but it has four structural
 weaknesses:
 
-1. **Every chunk write rewrites the entire 8 KiB header**, so a 1 KiB chunk pays
+1. **Sector rounding wastes a lot of disk.** Every touched chunk consumes a whole
+   4 KiB sector regardless of payload. Measured on a real 293k-chunk server world:
+   **+66% over its own payload**, and 40× amplification in POI storage, where
+   381 KB of data occupies 15.2 MB of files.
+2. **Every chunk write rewrites the entire 8 KiB header**, so a 1 KiB chunk pays
    8 KiB of header cost, and a torn header write can damage the pointers of up to
    1023 unrelated sibling chunks.
-2. **Sector allocation is first-fit with no compaction, ever.** Region files grow
+3. **Sector allocation is first-fit with no compaction, ever.** Region files grow
    monotonically as chunks relocate and leave holes.
-3. **`sync-chunk-writes` defaults to true**, giving an fsync-class operation per
-   chunk write, with no group commit.
 4. **Chunk and POI data cannot be committed together.** They live in separate IO
    workers over separate directories, so a crash between the two writes leaves
    them inconsistent with no mechanism to detect it.
 
-**Item 4 is the primary justification for this project.** It is the one weakness
-with no workaround at the filesystem level: a single atomic write batch across
-column families fixes it, and nothing else does.
+Items 1 and 2 are **measured** wins for this project: RocksDB used **33.9% less
+disk** than Anvil on a real world, and writes an estimated 0.32× the bytes. Item 4
+has no filesystem-level workaround at all, but is not yet implemented — chunk and
+POI currently get separate databases.
 
 ## Honest framing
+
+**RocksDB does not compress Minecraft chunks better than vanilla.** Per-chunk
+DEFLATE achieves 7.83× on a real world against RocksDB's 7.14×. The disk saving
+comes entirely from not paying sector padding, and the project spent three phases
+chasing a compression advantage that does not exist. See "What measurement
+changed".
 
 The read path will get **worse**, not better. Anvil resolves a chunk in one
 in-memory index hit and one seek; that is O(1) and no LSM can beat it.
@@ -43,10 +52,30 @@ may capture a torn header, and because Anvil has no write-ahead log that damage 
 unrecoverable and silent. A snapshot of a RocksDB world can be replayed back to a
 valid state.
 
-The three real performance wins — ZSTD instead of DEFLATE, group commit instead of
-per-write fsync, and incremental autosave — are all achievable *without* replacing
-the storage engine, at a fraction of the effort and with `.mca` compatibility
-preserved. If you want a faster server, do those three things instead of this.
+Two of the three vanilla-compatible performance fixes still stand on their own —
+group commit instead of per-write fsync, and incremental autosave — and need no
+engine swap. The third, "ZSTD instead of DEFLATE", is **retracted**: it makes
+compression slightly worse on real chunk data.
+
+## Verification
+
+Validated against a real 1.4 GB technical-server world (DataVersion 2586,
+1,622 region files, all three dimensions plus POI):
+
+```
+chunks=293207 verified=293207 mismatches=0 readFailures=0
+RESULT: PASS -- all 293,207 chunks round-tripped with equivalent NBT
+```
+
+Run it yourself against any world — region files are opened read-only and all
+writes go to a scratch database in a temp directory:
+
+```bash
+./gradlew fidelity -Pworld=/path/to/world [-Plimit=5000]
+```
+
+`tools/mca_stats.py` reports Anvil size, ratio and fragmentation statistics
+directly from `.mca` files, with no JVM or Minecraft needed.
 
 ## What measurement changed
 
@@ -87,9 +116,43 @@ Secondary WiredTiger costs, recorded because they were real: three source patche
 to compile on GCC 16, and a distribution that ships no compressor extensions at
 all, silently producing an *expanded* 0.86× database.
 
-Full data, method, and the three harness bugs found and corrected along the way:
+**Phase 1a / Step 6 — the compression rationale died, and a better one replaced
+it.** Both earlier phases sized their corpus from `RegionFile.ChunkBuffer`'s
+8096-byte allocation, which turns out to track the *compressed* chunk. Real
+uncompressed chunk NBT is far larger, and on a played-in world it compresses about
+half as well as fresh worldgen suggests:
+
+| | Synthetic | Generated world | **Real server world** |
+|---|---|---|---|
+| Mean uncompressed chunk | 8 KiB | 52 KiB | **28 KiB** (max 2.1 MiB) |
+| Vanilla DEFLATE ratio | 4.76× | 14.56× | **7.83×** |
+
+So per-chunk DEFLATE already extracts nearly all the redundancy, and ZSTD does
+slightly *worse* on the same values (7.14×). LZ4 is much worse (9.25× vs 13.93× on
+generated data), so the earlier suggestion to prefer it "for speed" is retracted.
+**RocksDB does not compress Minecraft chunks better than vanilla.**
+
+But comparing compression ratios turned out to be the wrong question. Anvil
+allocates in whole 4 KiB sectors and rewrites an 8 KiB header per chunk save, and
+on a real world that padding is **+66% over its own payload**:
+
+| | Bytes | Ratio |
+|---|---|---|
+| Uncompressed NBT | 8,188,756,910 | — |
+| Anvil payload | 1,045,882,671 | 7.83× |
+| **Anvil actual on disk** | **1,736,006,292** | 4.72× |
+| **RocksDB actual on disk** | **1,147,195,844** | 7.14× |
+
+**RocksDB uses 33.9% less disk** — not because it compresses better, but because
+it does not pay sector padding. The effect is extreme in sparse dimensions and POI
+data: `poi` stores 381 KB of payload in 15.2 MB of files, a 40× amplification.
+
+Full data, method, and the six harness bugs found and corrected along the way
+(including one that inverted this very conclusion):
 - [`spike/phase0-blob-dict/FINDINGS.md`](spike/phase0-blob-dict/FINDINGS.md)
 - [`spike/phase0c-wiredtiger/FINDINGS.md`](spike/phase0c-wiredtiger/FINDINGS.md)
+- [`spike/phase1a-real-corpus/FINDINGS.md`](spike/phase1a-real-corpus/FINDINGS.md)
+- [`spike/step6-real-world/FINDINGS.md`](spike/step6-real-world/FINDINGS.md)
 - [`docs/storage-io-analysis.md`](docs/storage-io-analysis.md)
 
 ## Design
@@ -142,24 +205,16 @@ and a strict parity mode is retained.
 
 - [x] **Phase 0** — verify blob dictionary support; select design branch
 - [x] **Phase 0c** — benchmark WiredTiger against RocksDB (no JNI)
-- [ ] **Phase 1** — `chunk` CF behind the Mixin seam; round-trip fidelity harness
+- [x] **Phase 1** — chunk storage behind the Mixin seam; round-trip fidelity harness
+- [x] **Step 6** — validate against a real 293,207-chunk server world
 - [ ] **Phase 2** — `poi` into the same DB; atomic chunk+POI `WriteBatch`
 - [ ] **Phase 3** — `playerdata` + `state`
 - [ ] **Phase 4** — checkpoint-based recoverable snapshots
 - [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
 
-**Currently paused at the Phase 0/1 boundary, pending a deliberate decision.**
-
-Measurement removed or weakened three of the four original justifications (see
-"What measurement changed" above), leaving atomic cross-subsystem commits as the
-one pillar with no filesystem-level substitute. On SSD with copy-on-write
-snapshots available, that is a thin return against a permanent `.mca` converter
-obligation, a ~50 MB native dependency, a read path that regresses from optimal,
-and — from Phase 3 onward — a blast radius that includes player inventories.
-
-Proceeding is defensible as a hands-on exercise in embedded storage engines. That
-is a legitimate reason; it is simply a different one from the operational case the
-project started with, and worth naming rather than dressing up.
+Phase 1 works and is verified at real-world scale. The remaining phases are
+unstarted; Phase 2 is where the atomic-commit payoff actually lands, since chunk
+and POI currently get separate databases.
 
 ## Risks
 

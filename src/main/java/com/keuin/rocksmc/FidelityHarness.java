@@ -46,7 +46,10 @@ public final class FidelityHarness {
         public int chunksVerified;
         public int mismatches;
         public int readFailures;
+        /** Sum of compressed chunk payloads, excluding Anvil's sector padding. */
         public long compressedBytes;
+        /** Actual size of the .mca files, including sector padding and headers. */
+        public long anvilOnDisk;
         public long uncompressedBytes;
         public long rocksOnDisk;
         public final List<String> mismatchDetails = new ArrayList<>();
@@ -66,18 +69,32 @@ public final class FidelityHarness {
             StringBuilder sb = new StringBuilder();
             sb.append(String.format("chunks=%d verified=%d mismatches=%d readFailures=%d%n",
                 this.chunksFound, this.chunksVerified, this.mismatches, this.readFailures));
-            sb.append(String.format("anvil compressed   = %,d bytes (mean %,d/chunk)%n",
-                this.compressedBytes,
-                this.chunksFound == 0 ? 0 : this.compressedBytes / this.chunksFound));
             sb.append(String.format("uncompressed NBT   = %,d bytes (mean %,d/chunk)%n",
                 this.uncompressedBytes,
                 this.chunksFound == 0 ? 0 : this.uncompressedBytes / this.chunksFound));
-            sb.append(String.format("vanilla DEFLATE    = %.2fx%n", deflateRatio()));
+            sb.append(String.format("anvil payload      = %,d bytes (%.2fx, mean %,d/chunk)%n",
+                this.compressedBytes, deflateRatio(),
+                this.chunksFound == 0 ? 0 : this.compressedBytes / this.chunksFound));
+            if (this.anvilOnDisk > 0) {
+                // The fair comparison. Anvil allocates in whole 4 KiB sectors, so
+                // the payload sum understates what it actually consumes; comparing
+                // RocksDB's real files against Anvil's payload penalises RocksDB
+                // for space Anvil is also using.
+                sb.append(String.format("anvil ON-DISK      = %,d bytes (%.2fx) "
+                    + "[+%.1f%% sector padding]%n",
+                    this.anvilOnDisk, this.uncompressedBytes / (double)this.anvilOnDisk,
+                    (this.anvilOnDisk - this.compressedBytes) * 100.0 / this.compressedBytes));
+            }
             if (this.rocksOnDisk > 0) {
-                sb.append(String.format("rocksdb on-disk    = %,d bytes (%.2fx)%n",
+                sb.append(String.format("rocksdb ON-DISK    = %,d bytes (%.2fx)%n",
                     this.rocksOnDisk, rocksRatio()));
-                sb.append(String.format("rocksdb vs anvil   = %+.1f%% on-disk%n",
+                sb.append(String.format("  vs anvil payload : %+.1f%%%n",
                     (this.rocksOnDisk - this.compressedBytes) * 100.0 / this.compressedBytes));
+                if (this.anvilOnDisk > 0) {
+                    sb.append(String.format("  vs anvil ON-DISK : %+.1f%%   <-- the fair "
+                        + "file-to-file comparison%n",
+                        (this.rocksOnDisk - this.anvilOnDisk) * 100.0 / this.anvilOnDisk));
+                }
             }
             return sb.toString();
         }
@@ -113,12 +130,31 @@ public final class FidelityHarness {
         }
         Arrays.sort(regions);
 
+        // Record what Anvil actually consumes on disk, not just its payload sum.
+        // Anvil allocates in whole 4 KiB sectors and carries an 8 KiB header per
+        // file, so the payload total understates real usage -- on a real world by
+        // over 60%. Comparing RocksDB's real files against Anvil's payload would
+        // charge RocksDB for padding Anvil is also paying for.
+        //
+        // When a limit is set the .mca total covers the whole directory while only
+        // some chunks are processed, so it is left unset to avoid a bogus ratio.
+        if (limit <= 0) {
+            for (File region : regions) {
+                stats.anvilOnDisk += region.length();
+            }
+        }
+
         RocksMcConfig config = RocksMcConfig.of(new java.util.Properties());
         try (RocksChunkStore store = new RocksChunkStore(scratchDb, 0, config)) {
+            outer:
             for (File region : regions) {
                 for (RawChunk chunk : readRegion(region)) {
+                    // Break the OUTER loop: continuing would call readRegion() on
+                    // every remaining region file -- fully parsing and inflating
+                    // every chunk in each -- only to discard the results. That made
+                    // the earlier throughput figures meaningless.
                     if (limit > 0 && stats.chunksFound >= limit) {
-                        break;
+                        break outer;
                     }
                     stats.chunksFound++;
                     stats.compressedBytes += chunk.compressedLen;
@@ -141,7 +177,12 @@ public final class FidelityHarness {
                     }
                 }
             }
+            // Compact before measuring. sync() alone leaves un-merged L0 files and
+            // obsolete blobs on disk, which inflates the footprint and would bias
+            // the size comparison against RocksDB. The Phase 0/1a spikes all
+            // compacted first, so this keeps the methodology consistent.
             store.sync();
+            store.compact();
             stats.rocksOnDisk = directorySize(scratchDb, ".sst") + directorySize(scratchDb, ".blob");
         }
         return stats;
