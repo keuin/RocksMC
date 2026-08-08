@@ -34,11 +34,12 @@ POI currently get separate databases.
 
 ## Honest framing
 
-**RocksDB does not compress Minecraft chunks better than vanilla.** Per-chunk
-DEFLATE achieves 7.83× on a real world against RocksDB's 7.14×. The disk saving
-comes entirely from not paying sector padding, and the project spent three phases
-chasing a compression advantage that does not exist. See "What measurement
-changed".
+**RocksDB compresses Minecraft chunks better than vanilla — but only when tuned.**
+At ZSTD's default level 3 it *loses* (7.14× vs vanilla's 7.83×), which is what
+earlier drafts of this file reported. At level 9 with trained dictionaries and
+values kept in the LSM, it beats vanilla payload by 13% (Overworld) to 62% (POI).
+The mod's current shipped configuration is the untuned one, so it is presently on
+the losing side of that comparison. See "What measurement changed".
 
 The read path will get **worse**, not better. Anvil resolves a chunk in one
 in-memory index hit and one seek; that is O(1) and no LSM can beat it.
@@ -52,10 +53,14 @@ may capture a torn header, and because Anvil has no write-ahead log that damage 
 unrecoverable and silent. A snapshot of a RocksDB world can be replayed back to a
 valid state.
 
-Two of the three vanilla-compatible performance fixes still stand on their own —
-group commit instead of per-write fsync, and incremental autosave — and need no
-engine swap. The third, "ZSTD instead of DEFLATE", is **retracted**: it makes
-compression slightly worse on real chunk data.
+All three vanilla-compatible performance fixes still stand on their own and need
+no engine swap: group commit instead of per-write fsync, incremental autosave, and
+— now measured properly — **ZSTD instead of DEFLATE**. At level 9, ZSTD is both
+smaller and ~3× faster to decode than vanilla's deflate-6 on real chunk data, and
+`ChunkStreamVersion` already versions compression per chunk, so vanilla could
+adopt it *inside* `.mca` with full format compatibility. An earlier draft
+retracted this claim; the retraction was wrong, because it only tested ZSTD's
+default level.
 
 ## Verification
 
@@ -127,14 +132,45 @@ half as well as fresh worldgen suggests:
 | Mean uncompressed chunk | 8 KiB | 52 KiB | **28 KiB** (max 2.1 MiB) |
 | Vanilla DEFLATE ratio | 4.76× | 14.56× | **7.83×** |
 
-So per-chunk DEFLATE already extracts nearly all the redundancy, and ZSTD does
-slightly *worse* on the same values (7.14×). LZ4 is much worse (9.25× vs 13.93× on
-generated data), so the earlier suggestion to prefer it "for speed" is retracted.
-**RocksDB does not compress Minecraft chunks better than vanilla.**
+So per-chunk DEFLATE extracts far more redundancy than the synthetic corpus
+implied. At ZSTD's *default* level the engine loses to it (7.14× vs 7.83×), which
+is where the "compression rationale is dead" conclusion came from.
 
-But comparing compression ratios turned out to be the wrong question. Anvil
-allocates in whole 4 KiB sectors and rewrites an 8 KiB header per chunk save, and
-on a real world that padding is **+66% over its own payload**:
+**That conclusion was wrong, and Phase 1b found out why: only library defaults had
+ever been tested.** Sweeping levels and dictionaries on real per-dimension corpora:
+
+| Codec (Overworld stratum) | Ratio | Decode MB/s | vs vanilla |
+|---|---|---|---|
+| deflate-6 (vanilla) | 8.16× | 642 | — |
+| zstd-3 (library default) | 7.53× | 1874 | +8.3% size |
+| **zstd-9** | **8.30×** | **2022** | **−1.7% size, 3.15× decode** |
+| zstd-19 | 9.03× | 1613 | −9.7% size |
+| lz4 | 5.01× | 1460 | +62.8% size |
+| snappy | 4.78× | 2089 | +70.7% size |
+
+**zstd-9 wins on both axes simultaneously** — smaller and ~3× faster to decode.
+And there is no single "Minecraft ratio": across dimensions vanilla itself spans
+**4.5×–24.7×**, since End void compresses far better than player-built Overworld,
+and sub-KiB POI values barely compress at all.
+
+Two further corrections from the same sweep:
+
+- **Blob files ignore `CompressionOptions` entirely** — level *as well as*
+  dictionary. Configuring zstd at 3, 9 and 19 gave byte-identical blob output
+  (41,558,329 bytes each time) while the same settings changed SST output a lot.
+  Phase 0 had reported only the dictionary half of this.
+- **Dictionaries do work in LSM mode**: +14% (Overworld), +59% (End), but −11% for
+  POI. So the setting belongs per-data-type, not globally.
+
+The LZ4 finding, unusually, **held up** — it really is 45–102% larger on real data.
+
+Best tuned engine config beats vanilla payload by **13% (Overworld)** to
+**62% (POI)**. The mod currently ships the untuned configuration, so applying this
+is outstanding work.
+
+Separately, comparing compression ratios turned out not to be the main question.
+Anvil allocates in whole 4 KiB sectors and rewrites an 8 KiB header per chunk save,
+and on a real world that padding is **+66% over its own payload**:
 
 | | Bytes | Ratio |
 |---|---|---|

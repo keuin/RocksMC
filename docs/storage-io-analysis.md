@@ -262,23 +262,78 @@ cannot see any of it:
 - **Zero uses of `setDictionary` anywhere in the tree** — DEFLATE's preset
   dictionary facility is entirely unused
 
-This made shared-dictionary compression the most attractive part of the design.
-**Measurement killed that specific mechanism on both engines:** RocksDB blob files
-ignore trained dictionaries (byte-identical output with them on and off), keeping
-values in the LSM instead costs 140× compaction traffic for a 2.3% size win, and
-WiredTiger's `dictionary=` turned out to be per-page value dedup rather than
-trained dictionaries — also byte-identical on and off.
+#### There is no single "Minecraft compression ratio"
 
-What *does* recover cross-value scope is **page packing**: WiredTiger compressing
-whole leaf pages containing many values measured **5.65×**, against BlobDB's
-per-blob **4.76×** — a 15.7% edge (Phase 0c). So the scope argument was correct in
-principle; it simply arrives via page size rather than dictionaries, and the
-magnitude is modest.
+Measured on a real server world with vanilla's own codec (deflate-6), ratios span
+**4.5×–24.7×** depending purely on what kind of data a chunk holds:
 
-What survives regardless of engine: **DEFLATE → ZSTD** is a real CPU and ratio
-improvement. But `ChunkStreamVersion` already versions compression per chunk
-(`:16-18`), so vanilla could adopt ZSTD *inside* `.mca` and capture that with **no
-engine change and full format compatibility**.
+| Data | Mean chunk | deflate-6 ratio |
+|---|---|---|
+| Large chunks (upper tail) | 586.8 KiB | 24.66× |
+| End terrain | 14.2 KiB | 18.74× |
+| Nether terrain | 25.9 KiB | 8.69× |
+| Overworld terrain | 33.3 KiB | 8.16× |
+| POI (overworld) | 586 B | 4.56× |
+| POI (end) | 385 B | 2.87× |
+
+Any single figure for "Minecraft data" describes no real workload. The End
+compresses more than twice as well as the Overworld — uniform void versus
+player-built terrain — and POI values are too small for a codec to find much
+redundancy in at all.
+
+#### Codec comparison on real chunk data
+
+Measured directly, without engine framing (Phase 1b). Overworld stratum:
+
+| Codec | Ratio | Decode MB/s | vs deflate-6 |
+|---|---|---|---|
+| deflate-6 (vanilla) | 8.16× | 642 | — |
+| **zstd-9** | **8.30×** | **2022** | **−1.7% size, 3.15× decode** |
+| zstd-19 | 9.03× | 1613 | −9.7% size, 2.51× decode |
+| zstd-3 (library default) | 7.53× | 1874 | +8.3% size |
+| lz4 | 5.01× | 1460 | +62.8% size |
+| snappy | 4.78× | 2089 | +70.7% size |
+
+Three results matter:
+
+1. **zstd-9 dominates vanilla on both axes** — smaller *and* ~3× faster to decode.
+   There is no tradeoff to weigh. This is significant because decode sits in the
+   chunk-load path while encode happens off-thread at autosave.
+2. **LZ4 and Snappy lose badly on ratio** (+45% to +102%). They are only
+   interesting where per-call latency dominates, i.e. sub-KiB POI values.
+3. **Level choice matters more than codec choice.** ZSTD at its default level 3
+   *loses* to vanilla; at level 9 it wins. Two earlier conclusions in this project
+   were wrong precisely because they tested library defaults and generalised.
+
+#### Where dictionaries actually work
+
+Blob files ignore `CompressionOptions` **entirely** — level *and* dictionary.
+Configuring zstd at 3, 9 and 19 produced byte-identical blob output
+(41,558,329 bytes in all three cases), while the same settings changed SST output
+substantially. Only `blob_compression_type` is honoured for blobs.
+
+With values kept in the LSM, where the options are respected, trained dictionaries
+are worthwhile after all:
+
+| Stratum | zstd-9, no dict | zstd-9 + dict | Gain |
+|---|---|---|---|
+| Overworld | 8.25× | **9.40×** | +14% |
+| End | 19.06× | **30.40×** | +59% |
+| POI (overworld) | 12.10× | 10.75× | **−11%** |
+
+So the right setting is per-data-type: dictionaries help terrain substantially and
+actively hurt POI, where the dictionary costs more than it saves.
+
+WiredTiger reaches cross-value scope by a different route — compressing whole leaf
+pages containing many values, measured at 5.65× against BlobDB's per-blob 4.76× on
+synthetic data (Phase 0c). The scope argument was sound in principle; page packing
+and LSM dictionaries are simply two mechanisms for the same idea.
+
+**Bottom line:** a well-tuned engine configuration beats vanilla payload by
+**13% (overworld)** to **62% (POI)**. But note that `ChunkStreamVersion` already
+versions compression per chunk (`:16-18`), so vanilla could adopt ZSTD *inside*
+`.mca` and capture most of the codec win with **no engine change and full format
+compatibility**.
 
 ### 5.4 Why not an in-memory store
 
@@ -384,7 +439,8 @@ tiny `.dat` files, and per-read throwaway allocation (§5.2).
 optimal O(1), write amplification improves marginally at best, and absolute write
 volume is so low that none of it matters. The three genuine performance wins —
 
-1. ZSTD instead of DEFLATE (`ChunkStreamVersion.java:17`)
+1. ZSTD level 9 instead of DEFLATE-6 (`ChunkStreamVersion.java:17`) — measured
+   smaller *and* ~3× faster to decode on real chunk data (§5.3)
 2. group-commit instead of `O_DSYNC` per write (`RegionFile.java:55`)
 3. incremental rather than convoy autosave (`MinecraftServer.java:794`)
 

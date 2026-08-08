@@ -28,3 +28,5 @@ corpus.bin
 test-world/
 run/
 logs/
+spike/**/*.jar
+spike/**/out/

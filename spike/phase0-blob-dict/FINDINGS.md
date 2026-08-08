@@ -79,6 +79,17 @@ Control C vs D: **−8.3%**. Test A vs B: **+0.6%**.
 
 **Blob files ignore trained dictionaries. Confirmed.**
 
+> **Correction (Phase 1b).** This conclusion is *true but understated*. Blob files
+> ignore `CompressionOptions` **entirely** — the compression *level* as well as the
+> dictionary. Phase 1b configured zstd at levels 3, 9 and 19 and got byte-identical
+> blob output (41,558,329 bytes in all three cases), while the same options changed
+> SST output substantially. Only `blob_compression_type` is honoured for blobs.
+>
+> The narrower framing here led to a further wrong inference — that dictionaries are
+> useless for this workload generally. On real chunk data with values kept in the
+> LSM, dictionaries add **+14% ratio (overworld)** and **+59% (end)**. See
+> `../phase1b-codec-sweep/FINDINGS.md`.
+
 The decisive evidence is not the percentages but the exactness: **blob bytes are
 byte-identical between A and B in both runs** — `18798229`, then `6799207`. The
 dictionary setting had *literally zero* effect on blob encoding. Meanwhile the

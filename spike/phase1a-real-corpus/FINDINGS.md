@@ -53,6 +53,19 @@ Logical corpus: 26.3 MiB. Vanilla Anvil stores it in **1,897,252 bytes (14.56×)
 
 ### This kills the compression rationale outright
 
+> **Correction (Phase 1b): this section is wrong, and the error was testing only
+> library defaults.**
+>
+> Every ZSTD figure here used RocksDB's default level 3. Sweeping levels on real
+> per-dimension corpora shows **zstd-9 beats vanilla deflate-6 on both axes
+> simultaneously** — smaller output *and* ~3× faster decode — and with dictionaries
+> enabled in LSM mode the best engine config reaches **−13% (overworld)** to
+> **−62% (POI)** against vanilla payload. The "DEFLATE→ZSTD is not a win" retraction
+> below is therefore itself retracted.
+>
+> The LZ4 conclusion, by contrast, **held up**: LZ4 really is 45–102% larger on real
+> data. See `../phase1b-codec-sweep/FINDINGS.md`.
+
 Not "weakens" — **kills**. Earlier the story was "we lose cross-chunk dictionary
 scope but still gain DEFLATE→ZSTD." That gain does not exist on real data:
 per-chunk DEFLATE at level 6 already extracts essentially all the redundancy in a
@@ -65,6 +78,11 @@ LZ4/ZSTD over DEFLATE was based on synthetic data and is retracted.
 Dictionaries again produced almost nothing (D vs E: 14.07× vs 14.01×), consistent
 with Phase 0 — and this time even in the LSM, because a 51 KiB value is large
 enough that its *internal* redundancy dominates any cross-value sharing.
+
+> **Correction (Phase 1b):** the dictionary claim above is also wrong. Configs D and
+> E both left the zstd level at its default; at level 9 dictionaries add **+14%
+> (overworld)** and **+59% (end)** in LSM mode. They *do* hurt POI data (−11%), so
+> the right setting is per-data-type rather than global.
 
 ## Experiment 2 — bytes written, and a genuine win
 
@@ -100,18 +118,22 @@ whose relative weight *grows* as chunks get smaller.
 
 | Decision | Before | After |
 |---|---|---|
-| Blob files | on, `min_blob_size` 1 KiB | **unchanged** — 316× compaction reduction |
-| Blob compression | ZSTD | **unchanged** — LZ4 costs 57% more disk |
-| App-layer NBT compression | store uncompressed, let engine compress | **unchanged**, but expect ~3.5% *worse* on-disk than vanilla, not better |
-| Trained dictionaries | for LSM CFs | **keep, but expect ~nil** on chunk data |
-| "DEFLATE→ZSTD is a real win" | claimed | **retracted** — false on real data |
+| Blob files | on, `min_blob_size` 1 KiB | ⚠️ **Phase 1b: reconsider.** Blob files ignore compression *level and* dictionaries entirely, so keeping chunks in the LSM reaches 9.40× vs 7.45×. The 316× compaction figure is real but tiny in absolute terms (~0.2 KB vs ~68 KB per autosave) |
+| Blob compression | ZSTD | **confirmed** — LZ4 really is 45–102% larger on real data |
+| App-layer NBT compression | store uncompressed, let engine compress | ⚠️ **Phase 1b: at level 9 with dictionaries this beats vanilla by 13–62%**, not loses to it |
+| Trained dictionaries | for LSM CFs | ⚠️ **Phase 1b: +14% overworld, +59% end** in LSM mode. Harmful for POI (−11%) |
+| "DEFLATE→ZSTD is a real win" | claimed | ⚠️ **retraction itself retracted** — true at zstd-9, false only at the default level 3 |
 
 ## Updated justification ledger
+
+> **Phase 1b correction:** the "better compression" row below was measured with
+> ZSTD at its default level. At level 9 with dictionaries, RocksDB beats vanilla
+> payload by 13% (overworld) to 62% (POI). Row corrected inline.
 
 | Pillar | Status |
 |---|---|
 | Cross-chunk compression | ❌ Dead (Phase 0) |
-| Better compression than vanilla | ❌ **Dead — vanilla is 3.5% smaller** |
+| Better compression than vanilla | ✅ **Revised (Phase 1b): −13% to −62% at zstd-9 + dictionaries** |
 | Sequential writes / HDD | ⚠️ N/A (SSD target) |
 | Live snapshots | ⚠️ Weakened — CoW filesystems cover most |
 | Atomic cross-subsystem commits | ✅ Intact |
