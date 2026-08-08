@@ -61,20 +61,31 @@ output was byte-identical with them on and off, while a positive control on SST
 files gained 4–8%. Keeping values in the LSM to regain dictionary scope costs
 **140× more compaction traffic to save 2.3% of disk space**.
 
-**Phase 0c — WiredTiger is technically better, and that was not the expected
-result.** A pre-registered decision rule was fixed before measuring: WiredTiger
-wins only with a better ratio *and* bytes written within ~2×. It passed both —
-**5.65× vs 4.76× compression (15.7% better), bytes written 1.06×**. The predicted
-B-tree in-place-update penalty never materialised, because with BlobDB compaction
-is only 0.17% of RocksDB's total write volume; nearly all of it is flush, which
-both engines must do.
+**Phase 0c — WiredTiger compressed better than RocksDB, and that was not the
+expected result.** A pre-registered decision rule was fixed before measuring:
+WiredTiger wins only with a better ratio *and* bytes written within ~2×. It passed
+both — **5.65× vs 4.76× compression (15.7% better), bytes written 1.06×**. The
+predicted B-tree in-place-update penalty never materialised, because with BlobDB
+compaction is only 0.17% of RocksDB's total write volume; nearly all of it is
+flush, which both engines must do.
 
-RocksDB remains the choice on **licensing and packaging, not merit**: Apache-2.0
-versus WiredTiger's GPL-only (which a Fabric mod would inherit, foreclosing
-permissive release), prebuilt Maven natives versus three source patches on GCC 16,
-and a WiredTiger failure mode where the standard PyPI distribution ships no
-compressor extensions at all and silently produces a *0.86×* — i.e. expanded —
-database.
+Two later findings nonetheless settle the choice on RocksDB, and **not** on
+licensing:
+
+1. **The compression win inverts under the real pattern.** That 15.7% was measured
+   on a freshly written table. After 12 overwrite rounds — and chunk saves *are*
+   whole-value overwrites — WiredTiger's on-disk footprint was **2.1× larger**
+   (23.6 MB vs 11.2 MB).
+2. **WiredTiger has had no Java API since 2021.** WT-6675 removed it in 10.0.0.
+   Verified against the 11.3.1 source built for this spike: `lang/` is
+   python-only, there is no `ENABLE_JAVA` option, and the tree contains zero
+   `.java` files. An earlier draft of these docs claimed you would "package the
+   in-tree SWIG Java binding" — that was wrong; there is none to package. You
+   would author an FFI layer from scratch and maintain it per-platform.
+
+Secondary WiredTiger costs, recorded because they were real: three source patches
+to compile on GCC 16, and a distribution that ships no compressor extensions at
+all, silently producing an *expanded* 0.86× database.
 
 Full data, method, and the three harness bugs found and corrected along the way:
 - [`spike/phase0-blob-dict/FINDINGS.md`](spike/phase0-blob-dict/FINDINGS.md)

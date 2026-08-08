@@ -151,29 +151,43 @@ handles large values natively.
 | Engine | Verdict | Reason |
 |---|---|---|
 | **RocksDB** | ✅ Recommended | LSM KV, point lookups, key-value separation, checkpoints, maintained `rocksdbjni` with prebuilt natives, Apache-2.0 |
-| **WiredTiger** | ⚠️ **Technically better, rejected on licence/packaging** | **Measured: 15.7% better compression ratio and bytes written within 1.06×** (Phase 0c). Loses on GPL2/GPL3-only licence, no prebuilt Java artifact, and three build patches needed on GCC 16 |
+| **WiredTiger** | ❌ **No Java API since 2021** | Measured *better* on a fresh write (15.7% ratio, bytes written 1.06×), but **2.1× larger on-disk after overwrites** — the representative pattern. And WT-6675 removed the Java language API in 10.0.0; there is no binding to use. See below |
 | **Redis + AOF** | ❌ | Redundant second copy of data already heap-resident; IPC per read; AOF-rewrite forks stall the tick loop. See §5.4 |
 | LMDB | ⚠️ Interesting, not evaluated | mmap reads are extremely fast and MVCC snapshots are excellent, but copy-on-write means random writes and there is **no built-in compression** — a hard loss given a measured 4.8–5.7× ratio |
 | TiKV | ❌ | Distributed, Raft-replicated, network RTT per point read. The tick loop needs sub-ms chunk reads |
 | ClickHouse | ❌❌ | Columnar OLAP. `loadChunk` is a single-key point read (`ThreadedAnvilChunkStorage.java:455-459`); MergeTree has no efficient single-row update, and every chunk save is a whole-value overwrite |
 
-### The WiredTiger question, and a retracted argument
+### The WiredTiger question, and two retracted arguments
 
-Two objections were originally raised against WiredTiger. **One of them was
+Three claims were made about WiredTiger over the course of this work. **Two were
 wrong, and it is worth recording which.**
 
-*Retracted:* "WiredTiger probably lacks ZSTD trained-dictionary support, so it
+*Retracted #1:* "WiredTiger probably lacks ZSTD trained-dictionary support, so it
 forfeits cross-chunk compression." Phase 0 showed RocksDB's **blob files ignore
 dictionaries too**, and Phase 0c showed WiredTiger's `dictionary=` setting is
 per-page value dedup, not trained dictionaries — output was byte-identical with
 it on and off. **Neither engine offers true cross-value dictionary compression.**
 The objection discriminated nothing.
 
-*Survived:* packaging and licensing. WiredTiger is GPL2/GPL3/Commercial, has no
-maintained Maven artifact with prebuilt natives, needed three patches to compile
-on GCC 16, and — most dangerously — its PyPI distribution ships **no compressor
-extensions at all**, silently producing an *uncompressed* database measuring
-0.86×, i.e. larger than its input.
+*Retracted #2:* "You would own multi-platform packaging of the in-tree SWIG Java
+binding." **There is no in-tree Java binding.** WiredTiger 10.0.0 (2021-04-12)
+removed it:
+
+> WT-6675 Remove WiredTiger Java language API and documentation
+
+Verified against the 11.3.1 source built for Phase 0c: `lang/` contains only
+`python`, there is no `ENABLE_JAVA` cmake option, and the tree holds zero `.java`
+files. The Java tutorials still online sit under a `/mongodb-3.4/` path —
+pre-removal artefacts. So the cost is not *packaging* a binding but *authoring*
+an FFI layer (~20-25 C entry points, `byte[]` ↔ `WT_ITEM` marshalling per chunk
+read and write, `WT_SESSION` thread-affinity, error mapping, native handle
+lifecycle) and maintaining it across platforms indefinitely.
+
+*Survived, and decisive:* the engine is not reachable from Java at acceptable
+cost. Secondary: GPL2/GPL3/Commercial licensing, three patches required to build
+on GCC 16, and a distribution that ships **no compressor extensions at all**,
+silently producing an *uncompressed* database measuring 0.86× — larger than its
+input.
 
 On the write-amplification hypothesis specifically: the prediction that a B-tree's
 in-place page updates would cost far more bytes than key-value separation **did
@@ -182,6 +196,14 @@ visible in RocksDB's own numbers: with BlobDB, compaction accounts for 233 KB ou
 of 134.6 MB total, or 0.17%. Nearly all write volume is *flush*, which both
 engines must do. Key-value separation was defending against a cost that barely
 exists at this value size and write rate.
+
+**But WiredTiger's compression advantage inverts under the representative access
+pattern.** Its 15.7% edge was measured on a freshly written table; after 12
+overwrite rounds its on-disk footprint was **2.1× RocksDB's** (23.6 MB vs
+11.2 MB). Chunk saves are whole-value overwrites by nature, so the overwrite
+figure is the one that matters, and there RocksDB wins by more than WiredTiger
+wins on a fresh write. The cause is uninvestigated — likely checkpoint retention
+or free-space fragmentation rather than steady-state size.
 
 Full data: `spike/phase0c-wiredtiger/FINDINGS.md`.
 
@@ -376,12 +398,12 @@ or recoverable rather than merely crash-consistent backups, has a real case — 
 should weigh it against a permanent `.mca` converter obligation, a native
 dependency, and a read path that gets worse.
 
-On engine choice: **WiredTiger measured better than RocksDB** on this workload
-(15.7% better ratio, bytes written within 1.06×). RocksDB remains the
-recommendation on licensing (Apache-2.0 vs GPL-only) and packaging (prebuilt Maven
-natives vs three build patches and a silent no-compression failure mode) — not on
-technical merit. That distinction is worth stating plainly rather than
-retrofitting a technical justification onto a practical decision.
+On engine choice: **RocksDB, and not merely by default.** WiredTiger measured
+better on a *fresh* write (15.7% ratio, bytes written 1.06×) and that finding
+stands — it contradicted the prediction. But it loses on the pattern this workload
+actually produces (2.1× larger on-disk after overwrites), and WT-6675 removed its
+Java language API in 2021, so there is no binding to use at all. The decision does
+not turn on licensing.
 
 ## 7. Caveats
 
@@ -399,10 +421,10 @@ retrofitting a technical justification onto a practical decision.
   *approximately* aligned, and the two engines' write-bytes statistics are not
   guaranteed to count identical things. The 1.06× bytes-written comparison should
   be read as "same order of magnitude", not a precise ratio.
-- One unexplained result: WiredTiger's on-disk size after 12 overwrite rounds was
-  2.1× RocksDB's, the opposite of its Experiment 1 advantage. Probably checkpoint
-  retention or free-space fragmentation rather than steady-state size, but it was
-  not investigated.
+- One result that inverts the headline: WiredTiger's on-disk size after 12
+  overwrite rounds was 2.1× RocksDB's, the opposite of its fresh-write advantage.
+  Probably checkpoint retention or free-space fragmentation, but not investigated.
+  Since chunk saves are overwrites, this is the more representative condition.
 - Two harness bugs were found and corrected during this work (double-counted blob
   bytes; an impossible sub-1.0× write-amplification figure from dividing
   compressed by uncompressed bytes), and one unfair comparison was caught before

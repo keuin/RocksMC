@@ -161,30 +161,70 @@ not steady-state size. It is a real open question, not a rounding artefact.
 **WiredTiger passes the pre-registered rule on technical merit: better ratio
 (5.65× vs 4.76×), bytes written within 2× (1.06×).**
 
-The recommendation nonetheless stays **RocksDB**, on the objection that survived
-scrutiny rather than the one that did not:
+**But it is not reachable from Java, which settles the question regardless.**
+
+### WiredTiger removed its Java API in 2021
+
+From the WiredTiger 10.0.0 changelog (2021-04-12), alongside removals of the
+Async API and LevelDB compatibility:
+
+> WT-6675 Remove WiredTiger Java language API and documentation
+
+Verified directly against the 11.3.1 source tree built for this spike:
+
+| Check | Result |
+|---|---|
+| `lang/` contents | `python` only |
+| `ENABLE_JAVA` cmake option | absent (only `ENABLE_PYTHON` exists) |
+| `*.java` files anywhere in tree | **zero** |
+| SWIG interface files | `lang/python/wiredtiger.i`, `bench/workgen/workgen.i` — no Java |
+
+The Java tutorials still hosted on `source.wiredtiger.com` are under a
+`/mongodb-3.4/` path — pre-removal artefacts. No maintained third-party Java
+binding was found.
+
+**This corrects an earlier claim in this project's docs** that one would "own
+multi-platform packaging of the in-tree SWIG Java binding." There is no such
+binding. The cost is not packaging an existing binding; it is *authoring* an FFI
+layer: ~20-25 C entry points, `byte[]` ↔ `WT_ITEM` marshalling on every chunk read
+and write, `WT_SESSION` thread-affinity management (sessions are not thread-safe),
+error-to-exception mapping, and native handle lifecycle with no GC safety net —
+then maintaining it across platforms indefinitely.
+
+### The compression win inverts under the real access pattern
+
+Experiment 1 measured a *freshly written* table. Experiment 2, after 12 overwrite
+rounds, showed WiredTiger's on-disk footprint at **23,556,096 vs RocksDB's
+11,180,892 — 2.1× larger.**
+
+Chunk saves are whole-value overwrites by nature (`RegionFile.writeChunk` always
+rewrites the entire chunk; `StorageIoWorker` coalesces repeated saves of the same
+hot chunk). **The overwrite condition is therefore the representative one**, and in
+it RocksDB wins on size by more than WiredTiger wins on a fresh write.
+
+This was initially recorded as a minor unexplained caveat. That was an
+under-weighting: the metric WiredTiger wins is measured in the less
+representative condition. The cause remains uninvestigated — likely checkpoint
+retention or free-space fragmentation rather than steady-state size — but
+"unexplained" is not the same as "unimportant."
+
+### Summary
 
 | Factor | RocksDB | WiredTiger |
 |---|---|---|
-| Compression ratio | 4.76× | **5.65×** (+15.7%) |
+| Ratio, fresh write | 4.76× | **5.65×** (+15.7%) |
 | Bytes written | 134.6 MB | 143.0 MB (1.06×) |
-| On-disk after overwrites | **11.2 MB** | 23.6 MB (2.1×, unexplained) |
+| **On-disk after overwrites** | **11.2 MB** | 23.6 MB (**2.1× worse**) |
 | Trained dictionaries | ✗ | ✗ (both lack it) |
-| Licence | Apache-2.0 OR GPL-2.0 | **GPL2/GPL3/Commercial** |
-| Java binding | Maven Central, prebuilt natives | in-tree SWIG, self-packaged |
+| **Java API** | Maven Central, prebuilt natives | **none since 2021 (WT-6675)** |
+| Licence | Apache-2.0 OR GPL-2.0 | GPL2/GPL3/Commercial |
 | Builds on GCC 16 out of the box | ✓ | ✗ (three patches needed) |
 | Compression working by default | ✓ | ✗ (silent 0.86× trap) |
 
-The licence is decisive for anything beyond a personal experiment: a Fabric mod
-linking a GPL-only native library inherits GPL, foreclosing permissive release.
-Add three build patches, per-platform native packaging in perpetuity, and a
-failure mode where misconfiguration silently yields a *worse-than-useless* 0.86×
-database.
-
-A 15.7% size win does not buy that.
-
-**Honest summary: WiredTiger is technically the better engine for this workload
-and I expected the opposite. It loses on licensing and packaging, not on merit.**
+**Honest summary: WiredTiger compresses a freshly written table better than
+RocksDB, and I predicted the opposite. It loses on the overwrite pattern this
+workload actually produces, and it has no Java API at all — so the decision does
+not turn on licensing.**
 
 ## Caveats
 
