@@ -249,19 +249,48 @@ and a strict parity mode is retained.
 - [x] **Phase 0c** — benchmark WiredTiger against RocksDB (no JNI)
 - [x] **Phase 1** — chunk storage behind the Mixin seam; round-trip fidelity harness
 - [x] **Step 6** — validate against a real 293,207-chunk server world
-- [ ] **Phase 1d** — **blocker:** replace path-derived dimension IDs (L1)
+- [x] **Phase 1d** — replace path-derived dimension IDs with a persisted registry
+- [x] **Phase 1e** — beta hardening: format guard, blank-world guard, world
+      importer, Prometheus exporter, periodic stats, perf knobs
 - [ ] **Phase 2** — `poi` into the same DB; atomic chunk+POI `WriteBatch`
 - [ ] **Phase 3** — `playerdata` + `state`
 - [ ] **Phase 4** — checkpoint-based recoverable snapshots
 - [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
 
-Phase 1 works and is verified at real-world scale. The remaining phases are
-unstarted; Phase 2 is where the atomic-commit payoff actually lands, since chunk
-and POI currently get separate databases.
+**Beta-capable, not production-ready.** See
+[`docs/beta-setup.md`](docs/beta-setup.md) for deployment, and the untested areas
+worth watching in the first week — chiefly POI (never exercised by a live server)
+and crash recovery (the WAL is replayable in principle, never verified).
 
-**Phase 1d gates Phase 2.** Merging stores into one keyspace is exactly what turns
-the dimension-ID collision from harmless into destructive, so the addressing fix
-has to land first.
+Phase 2 is where the atomic-commit payoff lands, since chunk and POI still get
+separate databases.
+
+## Importing an existing world
+
+```bash
+./gradlew importWorld -Pworld=/path/to/world
+```
+
+Region files are opened **read-only** and never modified, so this is safe against
+a copy and reversible by deleting the `*.rocksdb` directories. Every chunk is read
+back and compared; the import exits non-zero rather than leaving a partial world.
+
+Oversized `.mcc` chunks are handled — earlier tooling in this project skipped
+them, which would have silently dropped the largest chunks.
+
+Not imported, because vanilla reads them directly and they need no conversion:
+`level.dat`, `playerdata/`, `data/`, `advancements/`. **Backups must include them.**
+
+## Metrics
+
+With `metrics-enabled=true`, Prometheus text format is served on
+`http://<bind>:<port>/metrics`, labelled by `dimension` and `store` so a technical
+server can be queried per dimension. No new dependency: it uses the JDK's own HTTP
+server.
+
+The four worth alerting on: `rocksmc_write_stopped` (any 1 is an incident),
+`rocksmc_delayed_write_rate`, `rocksmc_pending_compaction_bytes`, and
+`rocksmc_verify_failures_total` (must stay 0).
 
 ## Risks
 

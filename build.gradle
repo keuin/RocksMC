@@ -96,6 +96,39 @@ jar {
 }
 
 // ---------------------------------------------------------------------------
+// importWorld: convert an existing Anvil world into RocksDB stores beside it.
+//
+// Region files are opened READ-ONLY; the .mca data is never modified, so this is
+// safe to run against a copy and reversible by deleting the *.rocksdb dirs.
+//
+//   ./gradlew importWorld -Pworld=/path/to/world [-Poverwrite] [-Pconfig=file]
+// ---------------------------------------------------------------------------
+tasks.register('importWorld', JavaExec) {
+    group = 'rocksmc'
+    description = 'Import an existing Anvil world into RocksDB.'
+    dependsOn 'classes'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.keuin.rocksmc.ImportMain'
+    maxHeapSize = '4G'
+
+    doFirst {
+        if (!project.hasProperty('world')) {
+            throw new GradleException(
+                "Specify the world: ./gradlew importWorld -Pworld=/path/to/world")
+        }
+        def argv = ['--world', project.property('world').toString()]
+        if (project.hasProperty('overwrite')) {
+            argv << '--overwrite'
+        }
+        if (project.hasProperty('config')) {
+            argv << '--config' << project.property('config').toString()
+        }
+        args = argv
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fidelity: round-trip real .mca chunks through RocksDB and verify NBT equality.
 //
 // Runs outside the game against any world directory, including real server

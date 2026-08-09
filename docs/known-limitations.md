@@ -9,7 +9,32 @@ bites today or only later, and what fixing it would take.
 
 **Severity:** latent today, **data-destroying at Phase 2**
 **Location:** `RegionBasedStorageMixin.rocksmc$dimensionId(File)`
-**Status:** open
+**Status:** ✅ **RESOLVED** (Phase 1d, commit `7402825`)
+
+> **Resolution.** `DimensionKey` now inverts vanilla's
+> `DimensionType.getSaveDirectory` with a single anchored regex, recognising all
+> four layouts including `dimensions/<namespace>/<path>`, and rejecting anything it
+> does not understand rather than defaulting to the overworld. `DimensionRegistry`
+> assigns each identity a stable ordinal persisted in a `dimensions` column family,
+> with vanilla dimensions pinned to 0/1/2.
+>
+> The registry key would have been the semantically correct input but is not
+> reachable from `RegionBasedStorage`; the alternatives (a `ThreadLocal` set in an
+> outer constructor, or an `@Redirect` on the construction site) both depend on when
+> and where code runs, which is exactly what other mods change. Deriving from the
+> directory depends on nothing but its own argument.
+>
+> 31 unit tests cover every layout, both storage leaves, the substring
+> misidentification the old code was prone to, and ordinal stability across reopen.
+> Real-world fidelity is unchanged at 293,207/293,207.
+>
+> One inherent ambiguity is documented and deliberately resolved in favour of
+> failing: a world whose *ancestor* path contains a `dimensions` segment is
+> structurally indistinguishable from a malformed custom dimension, so it is
+> rejected rather than guessed at.
+
+The original analysis follows, retained because the reasoning about why path
+matching was unsafe still explains the shape of the fix.
 
 ### The problem
 

@@ -83,6 +83,9 @@ public abstract class RegionBasedStorageMixin {
         // left completely untouched and the two backends can coexist on disk.
         File dbPath = new File(directory.getParentFile(),
             directory.getName() + ".rocksdb");
+
+        rocksmc$guardAgainstBlankStart(directory, dbPath, config);
+
         try {
             this.rocksmc$store = new RocksChunkStore(dbPath, dimension, config);
             RocksMc.logger().info("RocksDB store opened at {} for {}", dbPath, dimension);
@@ -91,6 +94,65 @@ public abstract class RegionBasedStorageMixin {
             // fallback would make a half-migrated world look healthy.
             throw new RuntimeException("rocksmc: failed to open RocksDB at " + dbPath, e);
         }
+    }
+
+    /**
+     * Refuses to start with an empty database beside a populated Anvil world.
+     *
+     * <p>This is the worst trap the mod can spring. Reads would all miss, vanilla
+     * would regenerate terrain into RocksDB, and {@code playerdata} is
+     * <em>shared</em> -- so players keep coordinates in a world that no longer
+     * matches and can materialise inside solid blocks. The {@code .mca} files stay
+     * intact, so it is recoverable, but only if someone notices before building on
+     * the regenerated terrain.
+     *
+     * <p>Detection is deliberately cheap and conservative: a non-empty
+     * {@code .mca} present while the database directory has no SST or blob files.
+     * Both conditions are cheap to check and neither produces false positives on a
+     * genuinely fresh world.
+     */
+    @Unique
+    private static void rocksmc$guardAgainstBlankStart(File anvilDir, File dbPath,
+            RocksMcConfig config) {
+        if (config.allowBlankStart()) {
+            return;
+        }
+
+        File[] regions = anvilDir.listFiles((d, n) -> n.endsWith(".mca"));
+        boolean anvilHasData = false;
+        if (regions != null) {
+            for (File region : regions) {
+                // Vanilla creates region files on demand and leaves them empty, so
+                // mere existence proves nothing; a header alone is 8 KiB.
+                if (region.length() > 8192L) {
+                    anvilHasData = true;
+                    break;
+                }
+            }
+        }
+        if (!anvilHasData) {
+            return;
+        }
+
+        File[] dbFiles = dbPath.listFiles((d, n) -> n.endsWith(".sst") || n.endsWith(".blob"));
+        boolean dbHasData = dbFiles != null && dbFiles.length > 0;
+        if (dbHasData) {
+            return;
+        }
+
+        throw new RuntimeException("rocksmc: refusing to start.\n"
+            + "  Anvil world has data:  " + anvilDir + "\n"
+            + "  RocksDB store is empty: " + dbPath + "\n"
+            + "\n"
+            + "Starting like this would regenerate terrain into RocksDB while\n"
+            + "playerdata still points at the old world, so players would keep their\n"
+            + "coordinates in a world that no longer matches -- possibly inside solid\n"
+            + "blocks. Your .mca files have NOT been touched.\n"
+            + "\n"
+            + "Either import the existing world first:\n"
+            + "  ./gradlew importWorld -Pworld=<world-dir>\n"
+            + "or set allow-blank-start=true in config/rocksmc.properties if a fresh\n"
+            + "world in this directory is genuinely what you want.");
     }
 
     @Inject(method = "getTagAt", at = @At("HEAD"), cancellable = true)
