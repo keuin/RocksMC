@@ -6,9 +6,12 @@ import net.minecraft.util.math.ChunkPos;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
 import org.rocksdb.Checkpoint;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompressionType;
+import org.rocksdb.DBOptions;
 import org.rocksdb.FlushOptions;
-import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteOptions;
@@ -19,6 +22,9 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -73,10 +79,15 @@ public final class RocksChunkStore implements ChunkStore {
     private static final int FORMAT_VERSION = 1;
 
     private final RocksDB db;
-    private final Options options;
+    private final DBOptions dbOptions;
+    private final ColumnFamilyOptions defaultCfOptions;
+    private final ColumnFamilyOptions metaCfOptions;
+    private final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
     private final WriteOptions writeOptions;
     private final BloomFilter bloomFilter;
     private final File path;
+    private final DimensionRegistry dimensionRegistry;
+    private final String dimensionIdentity;
     private final int dimensionId;
 
     private final AtomicLong reads = new AtomicLong();
@@ -85,13 +96,15 @@ public final class RocksChunkStore implements ChunkStore {
     private final AtomicLong bytesWritten = new AtomicLong();
 
     /**
-     * @param path        database directory; created if absent
-     * @param dimensionId distinguishes dimensions sharing one database
-     * @param config      tuning; see {@link RocksMcConfig}
+     * @param path     database directory; created if absent
+     * @param dimension the dimension whose chunks this store holds, derived from
+     *                  the save directory rather than guessed from a path prefix
+     * @param config   tuning; see {@link RocksMcConfig}
      */
-    public RocksChunkStore(File path, int dimensionId, RocksMcConfig config) throws IOException {
+    public RocksChunkStore(File path, DimensionKey dimension, RocksMcConfig config)
+            throws IOException {
         this.path = path;
-        this.dimensionId = dimensionId;
+        this.dimensionIdentity = dimension.identity();
 
         if (!path.exists() && !path.mkdirs()) {
             throw new IOException("Could not create RocksDB directory: " + path);
@@ -105,13 +118,12 @@ public final class RocksChunkStore implements ChunkStore {
             .setCacheIndexAndFilterBlocks(true)
             .setPinL0FilterAndIndexBlocksInCache(true);
 
-        this.options = new Options()
-            .setCreateIfMissing(true)
+        this.defaultCfOptions = new ColumnFamilyOptions()
             .setCompressionType(CompressionType.ZSTD_COMPRESSION)
             .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
             .setTableFormatConfig(tableConfig)
-            // Key-value separation: the whole point. Without it, compaction
-            // rewrites ~51 KiB values repeatedly.
+            // Key-value separation. Chunk values are tens of KiB, so without this
+            // leveled compaction would rewrite them repeatedly.
             .setEnableBlobFiles(true)
             .setMinBlobSize(config.minBlobSize())
             .setBlobCompressionType(CompressionType.ZSTD_COMPRESSION)
@@ -122,21 +134,53 @@ public final class RocksChunkStore implements ChunkStore {
             .setBlobGarbageCollectionAgeCutoff(0.25)
             .setBlobGarbageCollectionForceThreshold(0.5);
 
+        // The dimension registry holds a handful of tiny entries. Blob files and
+        // heavy compression would be pure overhead there.
+        this.metaCfOptions = new ColumnFamilyOptions()
+            .setCompressionType(CompressionType.NO_COMPRESSION);
+
+        this.dbOptions = new DBOptions()
+            .setCreateIfMissing(true)
+            .setCreateMissingColumnFamilies(true);
+
         this.writeOptions = new WriteOptions().setSync(config.syncWrites());
 
+        List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+        descriptors.add(new ColumnFamilyDescriptor(
+            RocksDB.DEFAULT_COLUMN_FAMILY, this.defaultCfOptions));
+        descriptors.add(new ColumnFamilyDescriptor(
+            DimensionRegistry.CF_NAME.getBytes(StandardCharsets.UTF_8), this.metaCfOptions));
+
         try {
-            this.db = RocksDB.open(this.options, path.getAbsolutePath());
+            this.db = RocksDB.open(this.dbOptions, path.getAbsolutePath(),
+                descriptors, this.cfHandles);
         } catch (RocksDBException e) {
             closeQuietly();
             throw new IOException("Failed to open RocksDB at " + path, e);
         }
+
+        try {
+            this.dimensionRegistry = new DimensionRegistry(this.db, this.cfHandles.get(1));
+            this.dimensionId = this.dimensionRegistry.ordinalFor(this.dimensionIdentity);
+        } catch (IOException e) {
+            // An unusable registry means keys cannot be interpreted, so refuse to
+            // serve rather than write chunks under an unknown dimension id.
+            this.db.close();
+            closeQuietly();
+            throw e;
+        }
+    }
+
+    /** The column family holding chunk data. */
+    private ColumnFamilyHandle dataCf() {
+        return this.cfHandles.get(0);
     }
 
     @Override
     public NbtCompound read(ChunkPos pos) throws IOException {
         byte[] value;
         try {
-            value = this.db.get(key(this.dimensionId, pos));
+            value = this.db.get(dataCf(), key(this.dimensionId, pos));
         } catch (RocksDBException e) {
             throw new IOException("RocksDB read failed for " + pos, e);
         }
@@ -162,7 +206,7 @@ public final class RocksChunkStore implements ChunkStore {
         byte[] value = buffer.toByteArray();
 
         try {
-            this.db.put(this.writeOptions, key(this.dimensionId, pos), value);
+            this.db.put(dataCf(), this.writeOptions, key(this.dimensionId, pos), value);
         } catch (RocksDBException e) {
             throw new IOException("RocksDB write failed for " + pos, e);
         }
@@ -258,9 +302,25 @@ public final class RocksChunkStore implements ChunkStore {
 
     public String statsSummary() {
         return String.format(
-            "rocksmc[%s dim=%d]: reads=%d (%d B), writes=%d (%d B), formatVersion=%d",
-            this.path.getName(), this.dimensionId, this.reads.get(), this.bytesRead.get(),
+            "rocksmc[%s %s ord=%d]: reads=%d (%d B), writes=%d (%d B), formatVersion=%d",
+            this.path.getName(), this.dimensionIdentity, this.dimensionId,
+            this.reads.get(), this.bytesRead.get(),
             this.writes.get(), this.bytesWritten.get(), FORMAT_VERSION);
+    }
+
+    /** The dimension this store holds, e.g. {@code twilightforest:twilight_forest}. */
+    public String dimensionIdentity() {
+        return this.dimensionIdentity;
+    }
+
+    /** The ordinal assigned to {@link #dimensionIdentity()} by the registry. */
+    public int dimensionOrdinal() {
+        return this.dimensionId;
+    }
+
+    /** Visible for tests: the persisted identity-to-ordinal mapping. */
+    public DimensionRegistry dimensionRegistry() {
+        return this.dimensionRegistry;
     }
 
     public long liveDataSize() {
@@ -279,6 +339,11 @@ public final class RocksChunkStore implements ChunkStore {
         } catch (IOException e) {
             failure = e;
         }
+        // Column family handles must be released before the database itself.
+        for (ColumnFamilyHandle handle : this.cfHandles) {
+            handle.close();
+        }
+        this.cfHandles.clear();
         if (this.db != null) {
             this.db.close();
         }
@@ -292,8 +357,14 @@ public final class RocksChunkStore implements ChunkStore {
         if (this.writeOptions != null) {
             this.writeOptions.close();
         }
-        if (this.options != null) {
-            this.options.close();
+        if (this.dbOptions != null) {
+            this.dbOptions.close();
+        }
+        if (this.defaultCfOptions != null) {
+            this.defaultCfOptions.close();
+        }
+        if (this.metaCfOptions != null) {
+            this.metaCfOptions.close();
         }
         if (this.bloomFilter != null) {
             this.bloomFilter.close();

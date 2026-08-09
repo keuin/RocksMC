@@ -1,6 +1,7 @@
 package com.keuin.rocksmc.mixin;
 
 import com.keuin.rocksmc.ChunkStore;
+import com.keuin.rocksmc.DimensionKey;
 import com.keuin.rocksmc.RocksChunkStore;
 import com.keuin.rocksmc.RocksMc;
 import com.keuin.rocksmc.RocksMcConfig;
@@ -56,57 +57,35 @@ public abstract class RegionBasedStorageMixin {
     @Unique
     private ChunkStore rocksmc$store;
 
-    /**
-     * Derives a dimension id from the storage directory.
-     *
-     * <p><b>KNOWN LIMITATION -- see {@code docs/known-limitations.md} (L1). This
-     * must be replaced before Phase 2.</b>
-     *
-     * <p>Vanilla lays dimensions out as {@code world/} (overworld),
-     * {@code world/DIM-1/} (nether), {@code world/DIM1/} (end), and
-     * <em>everything else</em> as {@code world/dimensions/<namespace>/<path>/}
-     * (see {@code DimensionType.getSaveDirectory}). This method only recognises
-     * the three vanilla cases, so every custom dimension from a datapack or mod
-     * falls through to 0 and collides with the overworld -- and with every other
-     * custom dimension.
-     *
-     * <p>That is harmless <em>today</em> only because each storage directory gets
-     * its own database, so colliding keys land in separate keyspaces and the
-     * dimension component is effectively redundant. Phase 2 merges stores into one
-     * database with column families, at which point identical keys mean silent
-     * overwrites and unrecoverable terrain loss.
-     *
-     * <p>The correct input is the {@code RegistryKey<World>}, which carries a
-     * namespaced id, rather than a path substring. See the limitations doc for the
-     * two candidate fixes and the migration concern for worlds already written
-     * with path-derived ids.
-     */
-    @Unique
-    private static int rocksmc$dimensionId(File directory) {
-        String path = directory.getAbsolutePath().replace('\\', '/');
-        if (path.contains("/DIM-1")) {
-            return -1;
-        }
-        if (path.contains("/DIM1")) {
-            return 1;
-        }
-        return 0;
-    }
-
     @Inject(method = "<init>", at = @At("TAIL"))
     private void rocksmc$onInit(File directory, boolean dsync, CallbackInfo ci) {
         RocksMcConfig config = RocksMc.config();
         if (!config.rocksEnabled()) {
             return;
         }
+
+        // Identity comes from the directory we were handed, which is the one input
+        // guaranteed to be correct here. See DimensionKey for why the registry key
+        // is not reachable and why out-of-band channels (ThreadLocal, @Redirect)
+        // were rejected as fragile against other mods.
+        DimensionKey dimension;
+        try {
+            dimension = DimensionKey.fromStorageDirectory(directory);
+        } catch (IllegalArgumentException e) {
+            // An unrecognised layout must never silently become the overworld:
+            // that would put two dimensions in one keyspace and lose terrain.
+            throw new RuntimeException("rocksmc: cannot determine which dimension "
+                + directory + " belongs to. Refusing to start rather than risk "
+                + "writing chunks under the wrong dimension id.", e);
+        }
+
         // Sibling of the Anvil directory, so an existing world's .mca files are
         // left completely untouched and the two backends can coexist on disk.
         File dbPath = new File(directory.getParentFile(),
             directory.getName() + ".rocksdb");
         try {
-            this.rocksmc$store = new RocksChunkStore(
-                dbPath, rocksmc$dimensionId(directory), config);
-            RocksMc.logger().info("RocksDB store opened at {}", dbPath);
+            this.rocksmc$store = new RocksChunkStore(dbPath, dimension, config);
+            RocksMc.logger().info("RocksDB store opened at {} for {}", dbPath, dimension);
         } catch (IOException e) {
             // Fail loudly rather than silently falling back to Anvil: a silent
             // fallback would make a half-migrated world look healthy.

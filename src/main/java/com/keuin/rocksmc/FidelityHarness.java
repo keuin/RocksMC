@@ -145,7 +145,11 @@ public final class FidelityHarness {
         }
 
         RocksMcConfig config = RocksMcConfig.of(new java.util.Properties());
-        try (RocksChunkStore store = new RocksChunkStore(scratchDb, 0, config)) {
+        // Parse the dimension from the real directory rather than hardcoding an
+        // ordinal, so the harness exercises the same identity path the server does
+        // -- including for custom dimensions.
+        DimensionKey dimension = DimensionKey.fromStorageDirectory(regionDir);
+        try (RocksChunkStore store = new RocksChunkStore(scratchDb, dimension, config)) {
             outer:
             for (File region : regions) {
                 for (RawChunk chunk : readRegion(region)) {

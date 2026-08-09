@@ -46,6 +46,17 @@ dependencies {
     // RocksDB ships platform natives inside the jar, so it must be bundled into
     // the mod rather than merely compiled against.
     implementation include("org.rocksdb:rocksdbjni:${project.rocksdb_version}")
+
+    testImplementation "org.junit.jupiter:junit-jupiter:5.14.4"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = false
+    }
 }
 
 // 1.16.5 targets Java 8. Compile to 8 so the mod loads on the same JVMs the
