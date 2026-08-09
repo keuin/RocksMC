@@ -245,6 +245,7 @@ and a strict parity mode is retained.
 - [x] **Phase 0c** — benchmark WiredTiger against RocksDB (no JNI)
 - [x] **Phase 1** — chunk storage behind the Mixin seam; round-trip fidelity harness
 - [x] **Step 6** — validate against a real 293,207-chunk server world
+- [ ] **Phase 1d** — **blocker:** replace path-derived dimension IDs (L1)
 - [ ] **Phase 2** — `poi` into the same DB; atomic chunk+POI `WriteBatch`
 - [ ] **Phase 3** — `playerdata` + `state`
 - [ ] **Phase 4** — checkpoint-based recoverable snapshots
@@ -254,8 +255,18 @@ Phase 1 works and is verified at real-world scale. The remaining phases are
 unstarted; Phase 2 is where the atomic-commit payoff actually lands, since chunk
 and POI currently get separate databases.
 
+**Phase 1d gates Phase 2.** Merging stores into one keyspace is exactly what turns
+the dimension-ID collision from harmless into destructive, so the addressing fix
+has to land first.
+
 ## Risks
 
+- **Custom dimensions are not correctly addressed.** Dimension IDs are derived by
+  path matching, which only recognises the three vanilla dimensions. Every
+  datapack or mod dimension collides with the Overworld. Harmless today because
+  each store gets its own database, but **data-destroying once Phase 2 merges
+  them into one keyspace.** Must be fixed before Phase 2 — see
+  [`docs/known-limitations.md`](docs/known-limitations.md) (L1).
 - **Ecosystem lock-out.** `.mca` is the interchange format for Amulet, Chunker,
   BlueMap/Dynmap, pregenerators, and every world editor. The Phase 5 converter is
   mandatory, and will likely be more code than the storage layer it replaces.
@@ -265,6 +276,9 @@ and POI currently get separate databases.
   no longer pure-Java portable.
 - **Unmeasured baseline.** No real world was generated. Compression and
   amplification figures come from synthetic corpora.
+
+See [`docs/known-limitations.md`](docs/known-limitations.md) for the full list of
+recorded design gaps.
 
 ## Licence
 

@@ -57,14 +57,29 @@ public abstract class RegionBasedStorageMixin {
     private ChunkStore rocksmc$store;
 
     /**
-     * Derives a stable dimension id from the storage directory so that separate
-     * dimensions never collide inside one keyspace.
+     * Derives a dimension id from the storage directory.
      *
-     * <p>Directory layout in 1.16.5: {@code world/region}, {@code world/DIM-1/region},
-     * {@code world/DIM1/region}, plus {@code world/poi} and its per-dimension
-     * equivalents. Hashing the path relative to the world root is sufficient here
-     * because each store currently gets its own database; it becomes load-bearing
-     * only once column families are shared.
+     * <p><b>KNOWN LIMITATION -- see {@code docs/known-limitations.md} (L1). This
+     * must be replaced before Phase 2.</b>
+     *
+     * <p>Vanilla lays dimensions out as {@code world/} (overworld),
+     * {@code world/DIM-1/} (nether), {@code world/DIM1/} (end), and
+     * <em>everything else</em> as {@code world/dimensions/<namespace>/<path>/}
+     * (see {@code DimensionType.getSaveDirectory}). This method only recognises
+     * the three vanilla cases, so every custom dimension from a datapack or mod
+     * falls through to 0 and collides with the overworld -- and with every other
+     * custom dimension.
+     *
+     * <p>That is harmless <em>today</em> only because each storage directory gets
+     * its own database, so colliding keys land in separate keyspaces and the
+     * dimension component is effectively redundant. Phase 2 merges stores into one
+     * database with column families, at which point identical keys mean silent
+     * overwrites and unrecoverable terrain loss.
+     *
+     * <p>The correct input is the {@code RegistryKey<World>}, which carries a
+     * namespaced id, rather than a path substring. See the limitations doc for the
+     * two candidate fixes and the migration concern for worlds already written
+     * with path-derived ids.
      */
     @Unique
     private static int rocksmc$dimensionId(File directory) {
