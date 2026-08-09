@@ -97,6 +97,16 @@ be in place, and must be included in backups.
 
 ## 4. Configuration
 
+> ⚠️ **Read this before copying the values.** Resources are currently allocated
+> **per store**, not per world (`RocksChunkStore.java:140-141,168-182`), and a world
+> with three dimensions opens **six** stores (region + poi each). So every memory
+> figure below multiplies by six.
+>
+> Phase 2 consolidates to one database per world and makes these genuinely shared;
+> see [`../TODO.md`](../TODO.md). It is agreed to land **before** the beta. The
+> values below are therefore sized for the *current* per-store reality — divide-by-six
+> figures that add up to the intended totals — and will be raised once sharing lands.
+
 `/srv/mc-beta/config/rocksmc.properties`:
 
 ```properties
@@ -105,13 +115,15 @@ min-blob-size=1024
 sync-writes=false
 verify-on-read=true
 
-# Performance: technical server on Optane
-max-background-jobs=8
-max-subcompactions=4
-write-buffer-size=134217728
-max-write-buffer-number=6
+# Performance: technical server on Optane.
+# NOTE: per-store values under the current layout. With 6 stores open these
+# total ~512 MiB block cache and ~1.5 GiB of memtables.
+max-background-jobs=4
+max-subcompactions=2
+write-buffer-size=67108864
+max-write-buffer-number=4
 bytes-per-sync=1048576
-block-cache-size=536870912
+block-cache-size=89478485
 level0-slowdown-writes-trigger=24
 
 # Telemetry
@@ -135,12 +147,16 @@ Reasoning for the choices that matter:
 - **`verify-on-read=true` for the first week.** Roughly halves write throughput,
   which Optane can absorb, and catches a corrupting bug where it happens instead
   of when a player finds a hole in the world. Turn it off once you trust it.
-- **`write-buffer-size=128 MiB`, 6 buffers.** Raised above the shipped default
-  because redstone and farms save the same chunks repeatedly; a bigger memtable
-  coalesces more of that before anything reaches disk.
-- **`block-cache-size=512 MiB`.** Note this caches index and filter blocks, not
-  chunk values — those live in blob files, and RocksDB 10.x has no
-  per-column-family blob cache. Chunk reads rely on this plus the OS page cache.
+- **`write-buffer-size=64 MiB`, 4 buffers, per store.** Larger memtables coalesce
+  more repeated saves of the same hot chunk, which is the dominant write pattern on
+  a technical server. Across six stores this is ~1.5 GiB of memtables at worst.
+- **`block-cache-size=85 MiB` per store** ≈ 512 MiB in total. Note this caches
+  index and filter blocks, **not** chunk values — those live in blob files, and
+  RocksDB 10.x has no per-column-family blob cache. Chunk reads rely on this plus
+  the OS page cache.
+- **`max-background-jobs=4` per store** = 24 background threads across six stores.
+  Raised from RocksDB's default of 2 because unfinished compaction eventually
+  stalls writes on the IO worker, but not to 8, which would mean 48 threads.
 
 ⚠️ **These values are reasoned, not measured.** Every unmeasured figure in this
 project has so far turned out wrong. Use the metrics below to correct them.

@@ -29,7 +29,8 @@ weaknesses:
 
 Item 1 is a **measured** win: RocksDB used **33.9% less disk** than Anvil on a real
 world. Item 4 has no filesystem-level workaround at all, but is not yet
-implemented — chunk and POI currently get separate databases.
+implemented — every `(dimension, leaf)` still gets its own database, which is itself
+a correctness problem (see the Phase 2 note under Roadmap).
 
 Item 2 is **not yet substantiated.** An earlier draft claimed RocksDB writes 0.32×
 vanilla's bytes; that figure excluded WAL traffic and came from a database too small
@@ -252,7 +253,8 @@ and a strict parity mode is retained.
 - [x] **Phase 1d** — replace path-derived dimension IDs with a persisted registry
 - [x] **Phase 1e** — beta hardening: format guard, blank-world guard, world
       importer, Prometheus exporter, periodic stats, perf knobs
-- [ ] **Phase 2** — `poi` into the same DB; atomic chunk+POI `WriteBatch`
+- [ ] **Phase 2** — **one database per world** (chunk + POI column families);
+      gives a single recovery point across dimensions
 - [ ] **Phase 3** — `playerdata` + `state`
 - [ ] **Phase 4** — checkpoint-based recoverable snapshots
 - [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
@@ -262,8 +264,13 @@ and a strict parity mode is retained.
 worth watching in the first week — chiefly POI (never exercised by a live server)
 and crash recovery (the WAL is replayable in principle, never verified).
 
-Phase 2 is where the atomic-commit payoff lands, since chunk and POI still get
-separate databases.
+⚠️ **Phase 2 is agreed to land before the beta**, because the current
+one-database-per-store layout cannot recover to a coherent cross-dimension state:
+each database has its own WAL, and vanilla saves worlds sequentially, so a crash
+mid-autosave recovers each dimension to a different point — a state no tick ever
+produced. That can duplicate or destroy an entity mid-teleport. See
+[`docs/known-limitations.md`](docs/known-limitations.md) L2 and
+[`TODO.md`](TODO.md).
 
 ## Importing an existing world
 

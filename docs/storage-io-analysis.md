@@ -222,16 +222,28 @@ Write amplification nevertheless matters, just not for throughput. See §5.7.
 
 ### 5.2 What genuinely improves
 
+- **A single recovery point across dimensions.** Vanilla's
+  `MinecraftServer.save()` iterates worlds sequentially, so one database per
+  dimension means one write-ahead log per dimension, and a crash mid-autosave
+  recovers each to a different point in that sequence. Since Minecraft has a single
+  tick loop for all dimensions, that is a state no tick ever produced — it can
+  duplicate or destroy an entity caught mid-teleport. One database per world
+  eliminates the failure class outright, and there is no filesystem-level substitute
+  for it. See `known-limitations.md` L2; delivered by Phase 2.
 - **Atomic cross-subsystem commits.** Today chunk and POI data live in separate
   `StorageIoWorker` instances over separate directories
   (`VersionedChunkStorage.java:26` vs `SerializingRegionBasedStorage.java:50`), so
   `ThreadedAnvilChunkStorage.save()` (`:625,648`) *cannot* commit them together.
-  A single `WriteBatch` across column families fixes that. **This is the pillar
-  with no filesystem-level substitute**, and after the corrections in §5.5 it is
-  the strongest remaining argument for the swap.
+  A `WriteBatch` spanning column families would fix that — but note this needs
+  more than consolidation: RocksDB guarantees atomicity per batch, and those writes
+  originate above the seam this mod injects at, on independent flush schedules.
+  Consolidation is necessary and not sufficient, so this remains follow-up work.
 - **Recoverable snapshots.** RocksDB checkpoints are hard-link based and
   near-instant with no pause. But see §5.5: copy-on-write filesystems already
   provide instant snapshots, so the real gain is *recoverability*, not capability.
+  Note also that a checkpoint is only world-wide once the databases are
+  consolidated; per-dimension checkpoints have the same tearing problem as
+  per-dimension WALs.
 - **Checksummed WAL** replacing crash-safety-by-write-ordering, and elimination of
   the torn-header blast radius (§3.1).
 - **Bounded space amplification** replacing never-compacted fragmentation (§3.2).

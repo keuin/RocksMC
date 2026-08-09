@@ -141,3 +141,55 @@ database-open failure: a half-addressed world that looks healthy is worse than a
 server that will not boot.
 
 Not yet implemented.
+
+---
+
+## L2: separate databases cannot recover to a coherent cross-dimension state
+
+**Severity:** **corrupting on crash** — can duplicate or destroy entities
+**Location:** `RegionBasedStorageMixin` opens one database per storage directory
+**Status:** open; fixed by Phase 2 (see [`../TODO.md`](../TODO.md)), which is
+agreed to land **before** the beta
+
+### The problem
+
+`MinecraftServer.save()` iterates worlds **sequentially** — Overworld, then Nether,
+then End — calling `serverWorld.save(...)` on each independently.
+
+Each `(dimension, leaf)` currently gets its own RocksDB, so each has its own
+write-ahead log and its own group-commit boundary. A crash part-way through an
+autosave therefore recovers every database to a *different* point in that sequence.
+
+Minecraft runs a single tick loop for all dimensions, so there is no tick at which
+the Overworld had finished saving but the Nether had not. **Recovery lands on a
+state that no tick ever produced.**
+
+### Why that is worse than losing a few seconds
+
+Cross-dimension state exists, and a torn recovery splits it:
+
+| Coupling | Torn outcome |
+|---|---|
+| Entity teleport between dimensions (`Entity.moveToWorld`) | The entity is removed from the source and added to the destination. Two commit boundaries mean it can end up in **both** worlds — a duplication bug created by crash recovery — or in **neither** |
+| Nether portal linkage | A paired portal survives on one side only |
+| Map item data | All map state routes through the *Overworld's* `PersistentStateManager` regardless of which dimension the map depicts, so a Nether map already depends on Overworld storage |
+
+Entity duplication is the worst of these: it is an item and mob dupe that appears
+without any player action, and it would be indistinguishable from an exploit.
+
+### Secondary consequence: resources multiply
+
+Because each store constructs its own options, a three-dimension world opens six
+stores and multiplies every memory setting by six — block cache, memtables and
+background threads alike. `docs/beta-setup.md` documents per-store values that add
+up to the intended totals as an interim measure.
+
+### What the fix does and does not give
+
+One database per world gives **one WAL and therefore one recovery point** across all
+dimensions, which removes this failure class entirely.
+
+It does **not** by itself make chunk and POI writes atomic with respect to each
+other: RocksDB guarantees atomicity per `WriteBatch`, and vanilla's writes originate
+in independent `StorageIoWorker` instances above this mod's seam. That remains
+follow-up work and should not be claimed on the strength of consolidation alone.
