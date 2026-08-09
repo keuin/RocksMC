@@ -30,3 +30,5 @@ run/
 logs/
 spike/**/*.jar
 spike/**/out/
+spike/**/results-*.json
+spike/**/results-*.log

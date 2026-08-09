@@ -215,13 +215,10 @@ Full data: `spike/phase0c-wiredtiger/FINDINGS.md`.
 point lookup may probe memtable, then multiple levels, then a blob file
 dereference. O(1) is the floor and Anvil is already there.
 
-**Write amplification barely improves.** Anvil's ~2× is already good. BlobDB
-achieves roughly comparable amplification; plain leveled compaction on 8 KiB
-values would be far worse.
+**Write throughput is a non-issue.** At 8–40 MB per 5 minutes, even a 20×
+amplification is under 3 MB/s sustained — irrelevant on any SSD.
 
-**Throughput is a non-issue either way.** At 8–40 MB per 5 minutes, even a 20×
-amplification is under 3 MB/s sustained — irrelevant on any SSD. Write
-amplification matters here only for *flash endurance* over multi-year deployments.
+Write amplification nevertheless matters, just not for throughput. See §5.7.
 
 ### 5.2 What genuinely improves
 
@@ -416,6 +413,56 @@ saved.
 A log-structured engine converts this to sequential appends. If rotational storage
 were a target, that alone would justify the change; on SSD it is largely moot.
 
+### 5.7 Flash endurance
+
+Write throughput is irrelevant here (§5.1), but **total bytes written is not**.
+A Minecraft server runs continuously for months or years, so write amplification
+integrates into real SSD wear. This is the one performance-adjacent axis where the
+storage engine choice has lasting consequences.
+
+#### Anvil's fixed overhead
+
+Every chunk save rewrites the entire 8 KiB region header (`RegionFile.java:298-301`)
+in addition to the payload. Measured on a real world, the mean compressed chunk is
+**3.5 KiB**, so the header is roughly **70% of the bytes written per save**. That
+overhead is fixed, meaning its relative cost *grows* as chunks get smaller — and it
+is paid on every single write, forever.
+
+With `sync-chunk-writes` defaulting to true (`ServerPropertiesHandler.java:82`),
+each of those writes is also `O_DSYNC` (`RegionFile.java:55`), with no group commit.
+
+#### RocksDB's tradeoff
+
+Key-value separation avoids rewriting multi-KiB values during compaction. Against
+that, an LSM writes each value to the WAL, then to a flushed SST or blob file, then
+potentially again at each compaction level.
+
+**Both directions are currently unquantified.** Every measurement in this project
+so far is disqualified for endurance purposes:
+
+- The compaction experiment ran on an **11.2 MB database**, which never filled one
+  64 MB memtable and so never reached L1. It measured cold-start behaviour, not
+  steady state.
+- **All five harnesses disabled the WAL**, which is written on every put and is a
+  first-order contributor to wear.
+- The vanilla comparison is *derived* (payload + 8 KiB per write), not instrumented.
+
+#### Scale of the question
+
+Corrected from the (15×-wrong) figures previously published here: at ~82 KB/GiB
+compaction with blob files versus ~26 MB/GiB without, on a busy server writing
+~11 GiB logical per day, the difference integrates to roughly **+0.55 TB over five
+years — about +33% of total write volume**. Both numbers are floors, for the
+reasons above.
+
+Against consumer TBW ratings of 150–600 TB that is not catastrophic. It is also not
+negligible, and an earlier version of this document wrongly called it so.
+
+This directly contests the compression recommendation in §5.3: disabling blob files
+buys ~26% smaller storage but gives up whatever compaction saving key-value
+separation provides. **The two goals conflict and the tradeoff is not yet
+resolved.** Phase 1c is designed to measure it at real LSM depth with the WAL
+included and kernel-level cross-checking.
 
 ## 6. Conclusion
 

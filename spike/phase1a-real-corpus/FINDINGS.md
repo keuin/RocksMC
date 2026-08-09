@@ -86,6 +86,32 @@ enough that its *internal* redundancy dominates any cross-value sharing.
 
 ## Experiment 2 — bytes written, and a genuine win
 
+> ## ⚠️ Correction (Phase 1c): this experiment is INVALID for endurance claims
+>
+> Three defects, found after a reader challenged the "negligible" framing:
+>
+> **1. The database never developed an LSM tree.** It ended at **11.2 MB**.
+> RocksDB's default `write_buffer_size` is 64 MB and `max_bytes_for_level_base`
+> is 256 MB, so this database never filled a single memtable, never reached L1,
+> and **never exercised leveled compaction at all**. The 316× figure below
+> compares near-zero compaction against near-zero compaction in the cold-start
+> regime. It says nothing about a server that has been running for months.
+>
+> **2. The WAL was excluded.** `setDisableWAL(true)` was set here and in every
+> other harness in this project. The WAL is written on *every* put and is a
+> first-order contributor to flash wear, so no measurement here can support an
+> endurance conclusion.
+>
+> **3. Downstream arithmetic was wrong by 15×.** Text derived from this table
+> claimed "~5 KB vs ~1.7 MB per GB of logical writes". Recomputed from the
+> numbers below (12,708 and 4,016,870 bytes over 158.1 MiB logical), the correct
+> figures are **~82 KB vs ~26 MB per GiB** — and even those are a floor, because
+> of defect 1.
+>
+> Phase 1c re-measures with real LSM depth (L2/L3), the WAL included, and
+> kernel-level cross-checking via `/proc/self/io`. Treat everything in this
+> section as cold-start behaviour only.
+
 6 overwrite rounds, 158.1 MiB logical.
 
 | Config | Flush | Compaction | Total |
@@ -93,9 +119,10 @@ enough that its *internal* redundancy dominates any cross-value sharing.
 | blob(min=1KiB) ZSTD | 12,124,484 | **12,708** | 12,137,192 |
 | no blobs, ZSTD | 12,059,311 | 4,016,870 | 16,076,181 |
 
-BlobDB reduces compaction traffic **316×**. With 51 KiB values the case for
-key-value separation is far stronger than the synthetic corpus suggested (where it
-was 140×), because leveled compaction rewrites much larger values.
+BlobDB reduces compaction traffic **316×** *in this regime*. With 51 KiB values
+the ratio is larger than the synthetic corpus suggested (140×), because leveled
+compaction rewrites much larger values — but see the correction above: with no
+levels populated, this is not steady-state behaviour.
 
 ### Vanilla's write amplification is the real story
 
@@ -109,16 +136,21 @@ RocksDB (BlobDB):    12,137,192 bytes   = 0.32x
 ```
 
 **RocksDB writes about one third of vanilla's bytes for identical logical
-writes.** This is the first performance claim in the entire project that is both
-measured and favourable, and it was not on the original list of justifications. It
-follows directly from Anvil's fixed-cost header rewrite, which is pure overhead
-whose relative weight *grows* as chunks get smaller.
+writes.** It follows directly from Anvil's fixed-cost header rewrite, which is
+pure overhead whose relative weight *grows* as chunks get smaller.
+
+> ⚠️ **The 0.32× figure is optimistic for two reasons** (Phase 1c). The RocksDB
+> side excludes WAL traffic, which would be written on every put in production;
+> and it was measured with no LSM levels populated, so compaction is
+> understated. The vanilla side is also *derived* rather than instrumented. The
+> direction of the result is likely to hold — Anvil's fixed 8 KiB header is real
+> and large — but the magnitude is not trustworthy until Phase 1c re-measures.
 
 ## Revised design decisions
 
 | Decision | Before | After |
 |---|---|---|
-| Blob files | on, `min_blob_size` 1 KiB | ⚠️ **Phase 1b: reconsider.** Blob files ignore compression *level and* dictionaries entirely, so keeping chunks in the LSM reaches 9.40× vs 7.45×. The 316× compaction figure is real but tiny in absolute terms (~0.2 KB vs ~68 KB per autosave) |
+| Blob files | on, `min_blob_size` 1 KiB | ⚠️ **Contested.** Phase 1b: blob files ignore compression *level and* dictionaries entirely, so keeping chunks in the LSM reaches 9.40× vs 7.45× — a ~26% storage win. But the compaction cost of doing so is **unmeasured at real LSM depth** (see correction above), and integrated over years it is a flash-endurance question, not a rounding error. Pending Phase 1c |
 | Blob compression | ZSTD | **confirmed** — LZ4 really is 45–102% larger on real data |
 | App-layer NBT compression | store uncompressed, let engine compress | ⚠️ **Phase 1b: at level 9 with dictionaries this beats vanilla by 13–62%**, not loses to it |
 | Trained dictionaries | for LSM CFs | ⚠️ **Phase 1b: +14% overworld, +59% end** in LSM mode. Harmful for POI (−11%) |

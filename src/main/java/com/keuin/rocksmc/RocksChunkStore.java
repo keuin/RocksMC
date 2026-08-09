@@ -26,10 +26,16 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Design notes, with the measurements behind them</h2>
  *
- * <p><b>Blob files are on.</b> Real uncompressed chunk NBT averages ~51 KiB
- * (Phase 1a, measured from generated worlds). At that size leveled compaction
- * would repeatedly rewrite large values; key-value separation cut compaction
- * traffic by 316x in measurement, so blobs are not optional here.
+ * <p><b>Blob files are on, but the setting is contested.</b> Real uncompressed
+ * chunk NBT averages ~28-51 KiB. At that size leveled compaction would repeatedly
+ * rewrite large values, and key-value separation measured a 316x reduction in
+ * compaction traffic -- however that measurement is invalid for steady state: the
+ * test database was 11.2 MB, never filled a 64 MB memtable, and so never reached
+ * L1. Phase 1b separately found that blob files ignore compression level and
+ * dictionaries entirely, so keeping chunks in the LSM instead would store ~26%
+ * fewer bytes. Storage size and flash endurance therefore pull in opposite
+ * directions here; see spike/phase1c-endurance/ for the measurement that decides
+ * it.
  *
  * <p><b>NBT is stored uncompressed at the application layer</b> and compressed by
  * the engine instead. Honest caveat: this is <em>not</em> a compression win.

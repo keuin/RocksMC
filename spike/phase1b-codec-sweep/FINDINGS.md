@@ -186,16 +186,46 @@ Overworld data that yields **7.45×, worse than vanilla's 8.16×**. The best
 measured config reaches 9.40× — **26% fewer stored bytes**.
 
 This creates a genuine tension with Phase 1a, which found blob files cut
-compaction traffic **316×**. But the absolute numbers deflate the concern:
-extrapolating Phase 1a, per GB of logical writes blob mode costs ~5 KB of
-compaction versus ~1.7 MB without. At a realistic 8–40 MB autosave that is
-~0.2 KB versus ~68 KB. **Both are negligible**; the 316× multiplier is alarming
-only in relative terms.
+compaction traffic **316×**.
 
-**Recommendation (not yet applied):** raise `min_blob_size` above chunk size (or
-disable blob files), set zstd level 9 explicitly, and enable dictionaries for
-terrain — but *not* POI. Changing stored format warrants its own fidelity run, so
-this is recorded rather than committed.
+> ## ⚠️ Correction: the "negligible" dismissal below was wrong three times over
+>
+> The original text here read: *"per GB of logical writes blob mode costs ~5 KB of
+> compaction versus ~1.7 MB without... Both are negligible; the 316× multiplier is
+> alarming only in relative terms."* Every part of that is defective.
+>
+> **The arithmetic was wrong by 15×.** Recomputed from Phase 1a's actual numbers
+> (12,708 and 4,016,870 bytes over 158.1 MiB logical): **~82 KB vs ~26 MB per
+> GiB**, not ~5 KB vs ~1.7 MB.
+>
+> **"Negligible" ignored integration over time.** A server runs for years. At
+> 40 MB logical per 5-minute autosave (≈11.25 GiB/day):
+>
+> | Horizon | blob total | no-blob total | Extra writes |
+> |---|---|---|---|
+> | 1 year | 0.33 TB | 0.44 TB | +0.11 TB |
+> | 3 years | 0.99 TB | 1.32 TB | +0.33 TB |
+> | 5 years | 1.65 TB | **2.20 TB** | **+0.55 TB** |
+>
+> That is **+33% of total write volume, permanently**. Against consumer TBW
+> ratings of 150–600 TB it is not catastrophic, but it is real SSD wear and the
+> relative figure is what persists — the opposite of what the original text said.
+>
+> **The underlying measurement was invalid anyway.** Phase 1a's database ended at
+> 11.2 MB, never filling one 64 MB memtable, so it never reached L1 and never
+> exercised leveled compaction. The 316× figure describes cold-start behaviour.
+> All five harnesses in this project also disabled the WAL, which is written on
+> every put. So even the corrected 26 MB/GiB is a **floor**, not an estimate.
+>
+> Phase 1c re-measures at real LSM depth with the WAL included. Until then the
+> blob-vs-compression tradeoff is **open**, not resolved.
+
+**Recommendation (not yet applied, and now contested):** the compression case says
+raise `min_blob_size` above chunk size (or disable blob files), set zstd level 9
+explicitly, and enable dictionaries for terrain but not POI — worth ~26% fewer
+stored bytes. The endurance case says blob files avoid compaction traffic that
+compounds over a server's lifetime. **These conflict, and the compaction side is
+not yet measured in a valid regime.** Deferred to Phase 1c rather than guessed at.
 
 ## Predictions vs outcomes
 

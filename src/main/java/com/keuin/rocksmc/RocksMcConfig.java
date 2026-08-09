@@ -71,9 +71,15 @@ public final class RocksMcConfig {
     /**
      * Values at or above this size go to blob files rather than the LSM tree.
      *
-     * <p>Phase 1a measured real uncompressed chunk NBT at ~51 KiB mean, and blob
-     * files cut compaction traffic by 316x at that size, so essentially all chunks
-     * should qualify. 1 KiB is well below even the smallest observed chunk.
+     * <p>Real uncompressed chunk NBT is ~28-51 KiB mean, so at 1 KiB essentially
+     * every chunk goes to a blob file.
+     *
+     * <p>Whether that is the right default is <em>unresolved</em>. Blob files avoid
+     * compaction rewriting large values, but they also ignore the compression level
+     * and dictionary settings entirely, so keeping chunks in the LSM stores ~26%
+     * fewer bytes. The compaction saving was measured on a database too small to
+     * have LSM levels, so its true steady-state value is unknown. Raise this above
+     * chunk size to trade endurance for storage; see spike/phase1c-endurance/.
      */
     public long minBlobSize() {
         return this.minBlobSize;

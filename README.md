@@ -28,7 +28,9 @@ weaknesses:
    them inconsistent with no mechanism to detect it.
 
 Items 1 and 2 are **measured** wins for this project: RocksDB used **33.9% less
-disk** than Anvil on a real world, and writes an estimated 0.32× the bytes. Item 4
+disk** than Anvil on a real world, and writes an estimated 0.32× the bytes (that
+second figure is **pending re-measurement** — it excluded WAL traffic and was taken
+on a database too small to have LSM levels; see `spike/phase1c-endurance/`). Item 4
 has no filesystem-level workaround at all, but is not yet implemented — chunk and
 POI currently get separate databases.
 
