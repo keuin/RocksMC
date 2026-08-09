@@ -437,32 +437,52 @@ Key-value separation avoids rewriting multi-KiB values during compaction. Agains
 that, an LSM writes each value to the WAL, then to a flushed SST or blob file, then
 potentially again at each compaction level.
 
-**Both directions are currently unquantified.** Every measurement in this project
-so far is disqualified for endurance purposes:
+**Measured (Phase 1c)** at real LSM depth — three populated levels — with the WAL
+counted and RocksDB's counters cross-checked against `/proc/self/io`:
 
-- The compaction experiment ran on an **11.2 MB database**, which never filled one
-  64 MB memtable and so never reached L1. It measured cold-start behaviour, not
-  steady state.
-- **All five harnesses disabled the WAL**, which is written on every put and is a
-  first-order contributor to wear.
-- The vanilla comparison is *derived* (payload + 8 KiB per write), not instrumented.
+| Config | Engine amplification | On-disk |
+|---|---|---|
+| blob=on, `sync-writes=false` | **1.481×** | 115,303,090 |
+| blob=off, `sync-writes=false` | 1.607× | 105,441,791 |
 
-#### Scale of the question
+So key-value separation writes **8.5% fewer bytes** but stores **8.6% more on
+disk**, because blob files ignore the compression level and dictionary settings
+(§5.3). A near-symmetric trade: neither side dominates, and the choice becomes a
+deployment question rather than a correctness one.
 
-Corrected from the (15×-wrong) figures previously published here: at ~82 KB/GiB
-compaction with blob files versus ~26 MB/GiB without, on a busy server writing
-~11 GiB logical per day, the difference integrates to roughly **+0.55 TB over five
-years — about +33% of total write volume**. Both numbers are floors, for the
-reasons above.
+Three earlier claims in this document were wrong and are corrected here:
 
-Against consumer TBW ratings of 150–600 TB that is not catastrophic. It is also not
-negligible, and an earlier version of this document wrongly called it so.
+- "Blob files cut compaction 316×" — **off by more than two orders of magnitude.**
+  At real depth the ratio is **1.35–1.51×**. The original was measured on an 11.2 MB
+  database with no levels populated.
+- "~82 KB/GiB versus ~26 MB/GiB" — superseded; those were floors from the same
+  invalid run.
+- "RocksDB writes 0.32× vanilla" — **withdrawn.** It excluded the WAL, which alone
+  is ~1.0× logical. Vanilla has never been instrumented the same way, so no ratio
+  against it is currently defensible.
 
-This directly contests the compression recommendation in §5.3: disabling blob files
-buys ~26% smaller storage but gives up whatever compaction saving key-value
-separation provides. **The two goals conflict and the tradeoff is not yet
-resolved.** Phase 1c is designed to measure it at real LSM depth with the WAL
-included and kernel-level cross-checking.
+#### The dominant factor is `sync-writes`, and engine counters cannot see it
+
+| Config | Engine amp | Kernel amp (`/proc/self/io`) |
+|---|---|---|
+| blob=on, sync=false | 1.481× | **1.549×** |
+| blob=on, sync=true | 1.488× | **5.649×** |
+
+At identical operation counts, enabling per-write fsync moved RocksDB's own
+counters by **+0.4%** and kernel-observed writes by **3.65×**. An fsync per write
+forces partial 4 KiB blocks and filesystem metadata to disk, none of which appears
+in `WAL_FILE_BYTES` or `COMPACT_WRITE_BYTES`.
+
+Projected over five years at ~11 GiB/day logical, that flag costs roughly **82 TB**
+— about **22× the entire blob-versus-LSM difference (3.75 TB)**. The setting this
+analysis spent three sections debating is dwarfed by one durability option.
+
+Vanilla is not exempt: `sync-chunk-writes` defaults to true, so it pays `O_DSYNC`
+per chunk write with no group commit. This is a shared cost.
+
+Measured on a copy-on-write filesystem, where fsync is unusually expensive; expect
+a smaller ratio on ext4/xfs. The direction, and the invisibility to engine
+counters, hold regardless. Full data: `spike/phase1c-endurance/RESULTS.md`.
 
 ## 6. Conclusion
 

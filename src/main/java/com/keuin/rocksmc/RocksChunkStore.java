@@ -32,16 +32,25 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Design notes, with the measurements behind them</h2>
  *
- * <p><b>Blob files are on, but the setting is contested.</b> Real uncompressed
- * chunk NBT averages ~28-51 KiB. At that size leveled compaction would repeatedly
- * rewrite large values, and key-value separation measured a 316x reduction in
- * compaction traffic -- however that measurement is invalid for steady state: the
- * test database was 11.2 MB, never filled a 64 MB memtable, and so never reached
- * L1. Phase 1b separately found that blob files ignore compression level and
- * dictionaries entirely, so keeping chunks in the LSM instead would store ~26%
- * fewer bytes. Storage size and flash endurance therefore pull in opposite
- * directions here; see spike/phase1c-endurance/ for the measurement that decides
- * it.
+ * <p><b>Blob files are on; the setting is a near-symmetric tradeoff.</b> Real
+ * uncompressed chunk NBT averages ~19-51 KiB. Measured at real LSM depth with the
+ * WAL counted (Phase 1c), key-value separation writes <b>8.5% fewer bytes</b> but
+ * stores <b>8.6% more on disk</b> than keeping values in the LSM -- because blob
+ * files ignore the compression level and dictionary settings entirely, so the LSM
+ * arm compresses better. Either choice is defensible: keep blobs on where SSD
+ * endurance matters, raise {@code min_blob_size} above chunk size where storage
+ * does.
+ *
+ * <p>An earlier comment here cited a 316x compaction reduction. That was measured
+ * on an 11.2 MB database with no LSM levels populated and was wrong by more than
+ * two orders of magnitude; the real ratio is 1.35-1.51x. See
+ * spike/phase1c-endurance/RESULTS.md.
+ *
+ * <p><b>The dominant endurance factor is not this setting.</b> {@code sync-writes}
+ * moves kernel-observed writes by 3.65x while barely changing RocksDB's own
+ * counters, because an fsync per write forces partial blocks and filesystem
+ * metadata to disk. Over five years that flag costs roughly 22x the entire
+ * blob-versus-LSM difference.
  *
  * <p><b>NBT is stored uncompressed at the application layer</b> and compressed by
  * the engine instead. Honest caveat: this is <em>not</em> a compression win.

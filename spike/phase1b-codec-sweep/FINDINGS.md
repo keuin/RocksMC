@@ -220,12 +220,38 @@ compaction traffic **316×**.
 > Phase 1c re-measures at real LSM depth with the WAL included. Until then the
 > blob-vs-compression tradeoff is **open**, not resolved.
 
-**Recommendation (not yet applied, and now contested):** the compression case says
+> ## ✅ Resolved (Phase 1c): the tradeoff is near-symmetric, and the tuning is viable
+>
+> Measured at real LSM depth (three populated levels) with the WAL counted:
+>
+> | | blob=on | blob=off | Difference |
+> |---|---|---|---|
+> | Bytes written | 1.481× logical | 1.607× logical | **+8.5% writes** |
+> | On-disk size | 115,303,090 | 105,441,791 | **−8.6% size** |
+>
+> **Roughly 8.6% less disk for roughly 8.5% more writes.** The compaction ratio
+> between the two arms is **1.35–1.51×**, not 316× — the earlier figure was wrong
+> by more than two orders of magnitude, having been taken on a database with no
+> levels at all.
+>
+> Over five years at 11.25 GiB/day the write difference is ~3.75 TB, a few percent
+> of a consumer drive's rated life. So **the recommendation below is unblocked**:
+> disabling blob files to gain ~26% compression is a defensible trade, not a
+> reckless one.
+>
+> Also worth noting for context: `sync-writes=true` costs ~82 TB over the same five
+> years, about **22× the entire blob-vs-LSM difference**. That single durability
+> flag dominates everything measured here. See `../phase1c-endurance/RESULTS.md`.
+
+**Recommendation (unblocked by Phase 1c):** the compression case says
 raise `min_blob_size` above chunk size (or disable blob files), set zstd level 9
 explicitly, and enable dictionaries for terrain but not POI — worth ~26% fewer
 stored bytes. The endurance case says blob files avoid compaction traffic that
-compounds over a server's lifetime. **These conflict, and the compaction side is
-not yet measured in a valid regime.** Deferred to Phase 1c rather than guessed at.
+compounds over a server's lifetime. **Phase 1c priced that at ~8.5% more bytes
+written, against ~8.6% less disk** — a near-symmetric trade, so either choice is
+defensible and it becomes a deployment question (storage-constrained versus
+SSD-constrained) rather than a correctness one. Still not applied here, because
+changing the stored format warrants its own fidelity run.
 
 ## Predictions vs outcomes
 

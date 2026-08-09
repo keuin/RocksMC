@@ -27,12 +27,16 @@ weaknesses:
    workers over separate directories, so a crash between the two writes leaves
    them inconsistent with no mechanism to detect it.
 
-Items 1 and 2 are **measured** wins for this project: RocksDB used **33.9% less
-disk** than Anvil on a real world, and writes an estimated 0.32× the bytes (that
-second figure is **pending re-measurement** — it excluded WAL traffic and was taken
-on a database too small to have LSM levels; see `spike/phase1c-endurance/`). Item 4
-has no filesystem-level workaround at all, but is not yet implemented — chunk and
-POI currently get separate databases.
+Item 1 is a **measured** win: RocksDB used **33.9% less disk** than Anvil on a real
+world. Item 4 has no filesystem-level workaround at all, but is not yet
+implemented — chunk and POI currently get separate databases.
+
+Item 2 is **not yet substantiated.** An earlier draft claimed RocksDB writes 0.32×
+vanilla's bytes; that figure excluded WAL traffic and came from a database too small
+to have LSM levels. Measured properly (Phase 1c), RocksDB's own total is **~1.48×
+logical**, of which the WAL alone is ~1.0×. Vanilla has never been instrumented the
+same way, so the comparison is withdrawn rather than corrected. See
+[`spike/phase1c-endurance/RESULTS.md`](spike/phase1c-endurance/RESULTS.md).
 
 ## Honest framing
 

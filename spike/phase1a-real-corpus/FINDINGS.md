@@ -124,6 +124,11 @@ the ratio is larger than the synthetic corpus suggested (140×), because leveled
 compaction rewrites much larger values — but see the correction above: with no
 levels populated, this is not steady-state behaviour.
 
+> **Measured at real depth (Phase 1c): the ratio is 1.35–1.51×, not 316×.** The
+> figure above was wrong by more than two orders of magnitude, in the direction
+> that flattered the design decision already taken. See
+> `../phase1c-endurance/RESULTS.md`.
+
 ### Vanilla's write amplification is the real story
 
 Vanilla writes, per chunk save: the compressed payload **plus a full 8 KiB header
