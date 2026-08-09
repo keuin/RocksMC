@@ -285,8 +285,18 @@ Not imported, because vanilla reads them directly and they need no conversion:
 
 With `metrics-enabled=true`, Prometheus text format is served on
 `http://<bind>:<port>/metrics`, labelled by `dimension` and `store` so a technical
-server can be queried per dimension. No new dependency: it uses the JDK's own HTTP
-server.
+server can be queried per dimension.
+
+Built on the official `io.prometheus` client (1.8.0). Because stores open lazily —
+a dimension's store only exists once something loads that dimension — the metrics
+are produced by a `MultiCollector` that is asked for a fresh set of snapshots on
+each scrape, rather than by long-lived `Counter`/`Gauge` objects. Series therefore
+appear and disappear with the stores they describe.
+
+All bundled modules are Java 8 bytecode, which the mod requires for Minecraft
+1.16.5. The text-only `exposition-textformats` module is used rather than
+`exposition-formats`, since the latter carries a shaded protobuf for the binary
+OpenMetrics format that this mod never emits — 43 KB instead of 2.0 MB.
 
 A Grafana dashboard is included at
 [`dashboards/rocksmc-overview.json`](dashboards/rocksmc-overview.json). The

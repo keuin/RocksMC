@@ -47,6 +47,24 @@ dependencies {
     // the mod rather than merely compiled against.
     implementation include("org.rocksdb:rocksdbjni:${project.rocksdb_version}")
 
+    // Prometheus client. Every module is listed explicitly rather than relying on
+    // transitive resolution, because Loom's include() nests only what it is given:
+    // a transitively-resolved jar would compile fine and then NoClassDefFoundError
+    // at runtime inside the mod jar.
+    //
+    // All modules are Java 8 bytecode (class file major version 52), which is why
+    // this is usable at all -- the mod targets Java 8 for Minecraft 1.16.5.
+    //
+    // exposition-textformats rather than exposition-formats: the latter bundles a
+    // shaded protobuf 4.35.0 for the binary OpenMetrics format, which this mod
+    // never emits. Choosing the text-only module drops ~2 MB of dead weight from
+    // the shipped jar (43 KB versus 2.0 MB).
+    implementation include("io.prometheus:prometheus-metrics-core:${project.prometheus_version}")
+    implementation include("io.prometheus:prometheus-metrics-model:${project.prometheus_version}")
+    implementation include("io.prometheus:prometheus-metrics-config:${project.prometheus_version}")
+    implementation include("io.prometheus:prometheus-metrics-exposition-textformats:${project.prometheus_version}")
+    implementation include("io.prometheus:prometheus-metrics-exporter-httpserver:${project.prometheus_version}")
+
     testImplementation "org.junit.jupiter:junit-jupiter:5.14.4"
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
