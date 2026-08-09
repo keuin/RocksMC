@@ -154,6 +154,13 @@ backend. The mod logs a warning about it at startup.
 http://127.0.0.1:9940/metrics
 ```
 
+A ready-made Grafana dashboard lives in
+[`dashboards/rocksmc-overview.json`](../dashboards/rocksmc-overview.json). The
+datasource is a template variable rather than a hardcoded UID, so import it and pick
+your Prometheus when prompted. See
+[`dashboards/README.md`](../dashboards/README.md) for the panel layout and what
+each one means.
+
 Every series is labelled `dimension`, `store` (`region`/`poi`) and `database`, so
 a technical server can be queried per dimension — the End behaves nothing like an
 Overworld full of farms.

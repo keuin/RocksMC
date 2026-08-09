@@ -288,6 +288,12 @@ With `metrics-enabled=true`, Prometheus text format is served on
 server can be queried per dimension. No new dependency: it uses the JDK's own HTTP
 server.
 
+A Grafana dashboard is included at
+[`dashboards/rocksmc-overview.json`](dashboards/rocksmc-overview.json). The
+datasource is a template variable rather than a hardcoded UID, so it imports cleanly
+into any environment; `instance` and `dimension` are selectable too. See
+[`dashboards/README.md`](dashboards/README.md).
+
 The four worth alerting on: `rocksmc_write_stopped` (any 1 is an incident),
 `rocksmc_delayed_write_rate`, `rocksmc_pending_compaction_bytes`, and
 `rocksmc_verify_failures_total` (must stay 0).
