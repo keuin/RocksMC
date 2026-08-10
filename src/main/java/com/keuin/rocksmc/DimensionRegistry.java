@@ -5,6 +5,8 @@ import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -42,9 +44,6 @@ import java.util.Map;
  * cap the dimension count for no benefit. See docs/design-decisions.md.
  */
 public final class DimensionRegistry {
-
-    /** Column family holding identity -> ordinal. */
-    public static final String CF_NAME = "dimensions";
 
     private static final byte[] NEXT_ORDINAL_KEY = "\u0000next".getBytes(StandardCharsets.UTF_8);
 
@@ -86,6 +85,23 @@ public final class DimensionRegistry {
     private final ColumnFamilyHandle cf;
     private final Map<String, Integer> cache = new HashMap<>();
 
+    /**
+     * Synced writes, so an ordinal assignment is durable before it is used.
+     *
+     * <p>This map is what makes every other key in the database interpretable: an
+     * ordinal handed out but not recorded could be given to a different dimension
+     * on the next run, putting two dimensions in one keyspace.
+     *
+     * <p>A synced WAL write rather than a memtable flush. Flushing was both
+     * heavier than needed -- durability comes from the WAL, not from reaching an
+     * SST -- and actively harmful now that dimensions share a database: the flush
+     * happened while holding this object's lock, so one dimension being seen for
+     * the first time would block every other dimension's chunk loads for the
+     * duration. The previous code also leaked a {@code FlushOptions} per newly
+     * seen dimension.
+     */
+    private final WriteOptions syncedWrites = new WriteOptions().setSync(true);
+
     public DimensionRegistry(RocksDB db, ColumnFamilyHandle cf) throws IOException {
         this.db = db;
         this.cf = cf;
@@ -110,9 +126,14 @@ public final class DimensionRegistry {
      * Returns the ordinal for a dimension, assigning one if this is the first time
      * it has been seen.
      *
-     * <p>The assignment is written before returning, so a crash cannot leave an
+     * <p>The assignment is durable before returning, so a crash cannot leave an
      * ordinal in use but unrecorded -- which would let a later run hand the same
      * number to a different dimension.
+     *
+     * <p>Synchronised because the check-allocate-persist-cache sequence must be
+     * atomic: {@link #allocateOrdinal} does a read-modify-write on the shared
+     * counter, so two threads both missing the cache could otherwise be handed the
+     * same ordinal.
      */
     public synchronized int ordinalFor(String identity) throws IOException {
         Integer known = this.cache.get(identity);
@@ -121,15 +142,20 @@ public final class DimensionRegistry {
         }
 
         int assigned = pinnedOrdinal(identity);
-        if (assigned < 0) {
+        boolean custom = assigned < 0;
+        if (custom) {
             assigned = allocateOrdinal();
         }
 
-        try {
-            this.db.put(this.cf, identity.getBytes(StandardCharsets.UTF_8), encodeInt(assigned));
-            // Durability matters more than speed here: this map is what makes every
-            // other key in the database interpretable.
-            this.db.flush(new org.rocksdb.FlushOptions().setWaitForFlush(true), this.cf);
+        // One batch, so the assignment and the counter advance commit together.
+        // Separately they could tear: a crash between them would leave an ordinal
+        // recorded that the counter does not know about, or vice versa.
+        try (WriteBatch batch = new WriteBatch()) {
+            batch.put(this.cf, identity.getBytes(StandardCharsets.UTF_8), encodeInt(assigned));
+            if (custom) {
+                batch.put(this.cf, NEXT_ORDINAL_KEY, encodeInt(assigned + 1));
+            }
+            this.db.write(this.syncedWrites, batch);
         } catch (RocksDBException e) {
             throw new IOException("failed to persist dimension ordinal for " + identity, e);
         }
@@ -143,7 +169,12 @@ public final class DimensionRegistry {
         return pinned == null ? -1 : pinned;
     }
 
-    /** Next unused ordinal, avoiding both the pinned range and anything in use. */
+    /**
+     * Next unused ordinal, avoiding both the pinned range and anything in use.
+     *
+     * <p>Read only: the caller commits the advanced counter in the same batch as
+     * the assignment it is for.
+     */
     private int allocateOrdinal() throws IOException {
         int next = FIRST_CUSTOM_ORDINAL;
         try {
@@ -156,14 +187,8 @@ public final class DimensionRegistry {
         }
 
         // Defend against a stale counter: never hand out a number already taken.
-        while (this.cache.containsValue(next)) {
+        while (this.cache.containsValue(next) || next < FIRST_CUSTOM_ORDINAL) {
             next++;
-        }
-
-        try {
-            this.db.put(this.cf, NEXT_ORDINAL_KEY, encodeInt(next + 1));
-        } catch (RocksDBException e) {
-            throw new IOException("failed to advance next dimension ordinal", e);
         }
         return next;
     }
@@ -175,6 +200,16 @@ public final class DimensionRegistry {
 
     public synchronized Map<String, Integer> snapshot() {
         return new HashMap<>(this.cache);
+    }
+
+    /**
+     * Releases the native write options.
+     *
+     * <p>Called by {@link RocksDatabase} on the last release. Does not touch the
+     * database or the column family handle, which the database owns.
+     */
+    void close() {
+        this.syncedWrites.close();
     }
 
     /** Internal keys are prefixed with a NUL byte, which no identity can contain. */

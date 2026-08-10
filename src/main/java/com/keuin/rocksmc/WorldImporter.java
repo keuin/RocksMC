@@ -8,19 +8,33 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Imports an existing Anvil world into RocksDB stores beside it.
+ * Imports an existing Anvil world into a single RocksDB database beside it.
  *
  * <h2>What this does and does not touch</h2>
  *
  * <p>Region files are opened <b>read-only</b>. For each {@code region} and
  * {@code poi} directory found, chunks are read with {@link AnvilReader} and written
- * into a sibling {@code <name>.rocksdb} database -- exactly the layout the mixin
- * expects at runtime, so a server started afterwards finds its data already there.
+ * into {@code <world>/rocksmc.db} -- one database for the whole world, exactly the
+ * layout the mixin expects at runtime, so a server started afterwards finds its
+ * data already there.
  *
  * <p>Nothing else in the world is converted, because nothing else needs to be:
  * {@code level.dat}, {@code playerdata}, {@code data} and {@code advancements}
  * remain flat files that vanilla reads directly. That also means a backup must
- * capture both the databases and those files.
+ * capture both the database and those files.
+ *
+ * <h2>Why one database, and why that matters here</h2>
+ *
+ * <p>Earlier builds wrote one database per {@code (dimension, leaf)}. Each had its
+ * own write-ahead log, and since the server saves worlds sequentially a crash
+ * mid-autosave could recover each to a different point -- a state no tick ever
+ * produced. Consolidating means the whole world shares one recovery point.
+ *
+ * <p>For the importer this has a concrete consequence: every dimension must be
+ * imported in <b>one</b> pass. The runtime blank-start guard checks whether the
+ * shared database holds any data, so importing only the overworld and then starting
+ * a server would let the nether regenerate silently. The importer therefore always
+ * walks the whole world, and reports per directory rather than exiting early.
  *
  * <h2>Why it does not go through the mod's runtime path</h2>
  *
@@ -88,7 +102,12 @@ public final class WorldImporter {
     }
 
     /**
-     * Imports every storage directory under a world.
+     * Imports every storage directory under a world into one shared database.
+     *
+     * <p>The database is opened once and held for the whole import, so all
+     * dimensions land in one place and the final compaction covers the lot. Each
+     * directory still gets its own {@link RocksChunkStore} view, because that is
+     * what carries the dimension ordinal and the column family.
      *
      * @param worldDir  the world root, containing {@code region/}
      * @param overwrite import into a database that already holds data
@@ -98,53 +117,74 @@ public final class WorldImporter {
             Progress progress) throws IOException {
         Result result = new Result();
 
-        for (File storageDir : findStorageDirectories(worldDir)) {
-            DimensionKey dimension;
-            try {
-                dimension = DimensionKey.fromStorageDirectory(storageDir);
-            } catch (IllegalArgumentException e) {
-                // Not a layout we can address; skipping silently would lose data, so
-                // record it as a hard failure for the caller to surface.
-                DirectoryResult skipped = new DirectoryResult(
-                    relative(worldDir, storageDir), "unknown");
-                skipped.failures.add("unrecognised layout: " + e.getMessage());
-                result.directories.add(skipped);
-                continue;
+        List<File> storageDirs = findStorageDirectories(worldDir);
+        if (storageDirs.isEmpty()) {
+            return result;
+        }
+
+        File dbPath = new File(worldDir, RocksDatabase.DIRECTORY_NAME);
+        if (!overwrite) {
+            File[] existing = dbPath.listFiles(
+                (d, n) -> n.endsWith(".sst") || n.endsWith(".blob"));
+            if (existing != null && existing.length > 0) {
+                // One refusal for the world, not one per directory: they all share
+                // the database, so the condition is world-wide.
+                DirectoryResult refused = new DirectoryResult(
+                    relative(worldDir, dbPath), "n/a");
+                refused.failures.add("database already contains data: " + dbPath
+                    + " (pass --overwrite to import anyway)");
+                result.directories.add(refused);
+                return result;
             }
-            result.directories.add(
-                importDirectory(worldDir, storageDir, dimension, config, overwrite, progress));
+        }
+
+        // The importer does its own verification pass, so verify-on-read would
+        // double the work for nothing.
+        RocksMcConfig importConfig = config.withVerifyOnRead(false);
+
+        RocksDatabase database = RocksDatabase.open(worldDir, importConfig);
+        try {
+            for (File storageDir : storageDirs) {
+                DimensionKey dimension;
+                try {
+                    dimension = DimensionKey.fromStorageDirectory(storageDir);
+                } catch (IllegalArgumentException e) {
+                    // Not a layout we can address; skipping silently would lose
+                    // data, so record it as a hard failure for the caller to
+                    // surface.
+                    DirectoryResult skipped = new DirectoryResult(
+                        relative(worldDir, storageDir), "unknown");
+                    skipped.failures.add("unrecognised layout: " + e.getMessage());
+                    result.directories.add(skipped);
+                    continue;
+                }
+                result.directories.add(importDirectory(
+                    worldDir, storageDir, dimension, importConfig, progress));
+            }
+
+            // Compact once for the whole world, after every dimension is in, rather
+            // than once per directory. Compacting between dimensions would merge
+            // data that later writes then overlap anyway, doing the work twice.
+            database.flushMemtables();
+            database.compact();
+        } finally {
+            database.release();
         }
         return result;
     }
 
     private static DirectoryResult importDirectory(File worldDir, File storageDir,
-            DimensionKey dimension, RocksMcConfig config, boolean overwrite,
-            Progress progress) throws IOException {
+            DimensionKey dimension, RocksMcConfig config, Progress progress)
+            throws IOException {
         DirectoryResult out = new DirectoryResult(
             relative(worldDir, storageDir), dimension.toString());
         long start = System.nanoTime();
 
-        File dbPath = new File(storageDir.getParentFile(),
-            storageDir.getName() + ".rocksdb");
-
-        if (!overwrite) {
-            File[] existing = dbPath.listFiles(
-                (d, n) -> n.endsWith(".sst") || n.endsWith(".blob"));
-            if (existing != null && existing.length > 0) {
-                out.failures.add("database already contains data: " + dbPath
-                    + " (pass --overwrite to import anyway)");
-                return out;
-            }
-        }
-
         List<File> regions = AnvilReader.regionFiles(storageDir);
         int estimated = regions.size() * 1024;
 
-        // verify-on-read would double the work; this importer does its own
-        // verification pass instead, so force it off for the duration.
-        RocksMcConfig importConfig = config;
-
-        try (RocksChunkStore store = new RocksChunkStore(dbPath, dimension, importConfig)) {
+        // Joins the database already open for this world -- see importWorld.
+        try (RocksChunkStore store = RocksChunkStore.open(dimension, config)) {
             for (File region : regions) {
                 List<AnvilReader.Entry> entries = AnvilReader.read(region, out.anomalies);
                 for (AnvilReader.Entry entry : entries) {
@@ -169,7 +209,7 @@ public final class WorldImporter {
 
             // Flush before verifying so the read path exercises stored data rather
             // than the memtable.
-            store.sync();
+            store.database().flushMemtables();
 
             for (File region : regions) {
                 AnvilReader.Report ignored = new AnvilReader.Report();
@@ -182,17 +222,19 @@ public final class WorldImporter {
                     }
                 }
             }
-
-            // Compact so the database is in steady state before the server starts,
-            // rather than the server paying for it during play.
-            store.compact();
         }
 
         out.elapsedMs = (System.nanoTime() - start) / 1_000_000L;
         return out;
     }
 
-    /** Finds every directory containing {@code .mca} files, excluding our own output. */
+    /**
+     * Finds every directory containing {@code .mca} files.
+     *
+     * <p>Skips both the current database directory and any leftover version 1
+     * {@code *.rocksdb} directories, so a re-import never tries to read its own
+     * output as a source.
+     */
     static List<File> findStorageDirectories(File worldDir) {
         List<File> found = new ArrayList<>();
         collect(worldDir, found);
@@ -212,7 +254,9 @@ public final class WorldImporter {
             }
         }
         for (File entry : entries) {
-            if (entry.isDirectory() && !entry.getName().endsWith(".rocksdb")) {
+            if (entry.isDirectory()
+                    && !entry.getName().endsWith(".rocksdb")
+                    && !entry.getName().equals(RocksDatabase.DIRECTORY_NAME)) {
                 collect(entry, found);
             }
         }

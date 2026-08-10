@@ -3,6 +3,7 @@ package com.keuin.rocksmc.mixin;
 import com.keuin.rocksmc.ChunkStore;
 import com.keuin.rocksmc.DimensionKey;
 import com.keuin.rocksmc.RocksChunkStore;
+import com.keuin.rocksmc.RocksDatabase;
 import com.keuin.rocksmc.RocksMc;
 import com.keuin.rocksmc.RocksMcConfig;
 import net.minecraft.nbt.NbtCompound;
@@ -44,9 +45,12 @@ import java.io.IOException;
  * </ul>
  *
  * <p>Because vanilla constructs this same class for both chunk and POI storage,
- * both are redirected automatically. They still get <em>separate</em> databases
- * for now, so the atomic chunk+POI commit remains future work; only the seam is
- * proven here.
+ * both are redirected automatically. Every one of a world's storage directories --
+ * six for a three-dimension world -- now resolves to a <em>single</em> shared
+ * database, so all dimensions share one write-ahead log and therefore one crash
+ * recovery point. See {@link com.keuin.rocksmc.RocksDatabase} for why that
+ * matters, and for what it still does not give (chunk and POI writes are not
+ * atomic with respect to each other).
  *
  * <p>When the backend is {@code anvil} (the default) every injection returns
  * immediately and vanilla behaviour is bit-for-bit unchanged.
@@ -79,21 +83,66 @@ public abstract class RegionBasedStorageMixin {
                 + "writing chunks under the wrong dimension id.", e);
         }
 
-        // Sibling of the Anvil directory, so an existing world's .mca files are
-        // left completely untouched and the two backends can coexist on disk.
-        File dbPath = new File(directory.getParentFile(),
-            directory.getName() + ".rocksdb");
+        // One database for the whole world, at <world>/rocksmc.db. The Anvil
+        // directories are left completely untouched, so the two backends can
+        // coexist on disk and rollback stays a config flip.
+        File dbPath = new File(dimension.root(), RocksDatabase.DIRECTORY_NAME);
 
+        rocksmc$guardAgainstLegacyLayout(directory, dbPath);
         rocksmc$guardAgainstBlankStart(directory, dbPath, config);
 
         try {
-            this.rocksmc$store = new RocksChunkStore(dbPath, dimension, config);
+            this.rocksmc$store = RocksChunkStore.open(dimension, config);
             RocksMc.logger().info("RocksDB store opened at {} for {}", dbPath, dimension);
         } catch (IOException e) {
             // Fail loudly rather than silently falling back to Anvil: a silent
             // fallback would make a half-migrated world look healthy.
             throw new RuntimeException("rocksmc: failed to open RocksDB at " + dbPath, e);
         }
+    }
+
+    /**
+     * Refuses to start on a world imported by an older build.
+     *
+     * <p>Format version 1 put each {@code (dimension, leaf)} in its own database at
+     * {@code <dir>.rocksdb}. Version 2 uses one database per world. The version
+     * marker lives <em>inside</em> a database, so it cannot catch this case: the new
+     * database is a different directory and simply looks absent, which the
+     * blank-start guard would then report as a fresh world beside populated Anvil
+     * files. That message would send an operator looking in the wrong place.
+     *
+     * <p>The old directories are not touched, so reverting to an older build with
+     * {@code backend=rocksdb} still works.
+     */
+    @Unique
+    private static void rocksmc$guardAgainstLegacyLayout(File anvilDir, File dbPath) {
+        File legacy = new File(anvilDir.getParentFile(), anvilDir.getName() + ".rocksdb");
+        File[] legacyFiles = legacy.listFiles(
+            (d, n) -> n.endsWith(".sst") || n.endsWith(".blob"));
+        if (legacyFiles == null || legacyFiles.length == 0) {
+            return;
+        }
+        File[] currentFiles = dbPath.listFiles(
+            (d, n) -> n.endsWith(".sst") || n.endsWith(".blob"));
+        if (currentFiles != null && currentFiles.length > 0) {
+            // Already migrated; the stale directory is just leftovers.
+            return;
+        }
+        throw new RuntimeException("rocksmc: refusing to start.\n"
+            + "  Found an on-disk format version 1 database: " + legacy + "\n"
+            + "  This build uses one database per world:      " + dbPath + "\n"
+            + "\n"
+            + "Version 1 gave every dimension its own database and its own\n"
+            + "write-ahead log. Because the server saves worlds sequentially, a\n"
+            + "crash mid-autosave could recover each one to a different point --\n"
+            + "a state no tick ever produced. Version 2 shares one log.\n"
+            + "\n"
+            + "There is no migration path. Re-import from the .mca files:\n"
+            + "  ./gradlew importWorld -Pworld=" + anvilDir.getParentFile() + "\n"
+            + "\n"
+            + "Your .mca files and the old *.rocksdb directories are untouched, so\n"
+            + "backend=anvil and older builds both still work. Delete the old\n"
+            + "*.rocksdb directories once the re-import is verified.");
     }
 
     /**
@@ -110,6 +159,12 @@ public abstract class RegionBasedStorageMixin {
      * {@code .mca} present while the database directory has no SST or blob files.
      * Both conditions are cheap to check and neither produces false positives on a
      * genuinely fresh world.
+     *
+     * <p>Note this runs per storage directory, and the database is now shared. A
+     * world whose overworld was imported but which has an un-imported dimension
+     * beside it is still caught, because the check is on that dimension's own
+     * {@code .mca} files -- but a database holding <em>any</em> data passes, so the
+     * importer must convert every dimension in one pass. It does.
      */
     @Unique
     private static void rocksmc$guardAgainstBlankStart(File anvilDir, File dbPath,

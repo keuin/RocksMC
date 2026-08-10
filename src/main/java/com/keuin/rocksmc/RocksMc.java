@@ -77,11 +77,16 @@ public final class RocksMc implements DedicatedServerModInitializer {
     }
 
     /**
-     * Logs a periodic summary of every open store.
+     * Logs a periodic summary of every open store and database.
      *
      * <p>Kept even when Prometheus is enabled: a log line survives in an archive
      * after a crash, whereas a scrape only exists if something was collecting at the
      * time. For a beta the post-mortem record matters more.
+     *
+     * <p>Two kinds of line, matching the two scopes. Per-store lines carry IO the
+     * store owns; per-database lines carry the shared state. Merging them would
+     * repeat a world's compaction figures once per dimension and invite exactly the
+     * overcounting the metric split exists to avoid.
      */
     private static void startStatsLogger() {
         int interval = config.statsLogIntervalSeconds();
@@ -101,26 +106,42 @@ public final class RocksMc implements DedicatedServerModInitializer {
         try {
             for (RocksChunkStore store : StoreRegistry.stores()) {
                 RocksChunkStore.Snapshot s = store.snapshot();
-                LOGGER.info("stats {} [{}]: reads={} writes={} readBytes={} writeBytes={} "
-                        + "sst={} blob={} keys~{} pendingCompaction={} running={}c/{}f "
-                        + "stalls={} stopped={}",
-                    s.dimension, s.leaf, s.reads, s.writes, s.bytesRead, s.bytesWritten,
-                    s.liveSstBytes, s.blobFileBytes, s.estimatedKeys,
-                    s.pendingCompactionBytes, s.runningCompactions, s.runningFlushes,
-                    s.delayedWriteRate, s.writeStopped);
-                // Surface the two conditions that actually cause tick lag, rather than
-                // leaving an operator to spot them in a wall of numbers.
-                if (s.writeStopped > 0) {
-                    LOGGER.error("rocksmc: writes are STOPPED on {} [{}] -- compaction "
-                        + "cannot keep up. Raise max-background-jobs.", s.dimension, s.leaf);
-                } else if (s.delayedWriteRate > 0) {
-                    LOGGER.warn("rocksmc: writes are being throttled on {} [{}] to {} B/s.",
-                        s.dimension, s.leaf, s.delayedWriteRate);
-                }
+                LOGGER.info("stats {} {} [{}]: reads={} writes={} readBytes={} "
+                        + "writeBytes={} ord={}",
+                    s.database, s.dimension, s.leaf, s.reads, s.writes,
+                    s.bytesRead, s.bytesWritten, s.dimensionOrdinal);
                 if (s.readFailures + s.writeFailures + s.verifyFailures > 0) {
                     LOGGER.error("rocksmc: failures on {} [{}]: read={} write={} verify={}",
                         s.dimension, s.leaf, s.readFailures, s.writeFailures,
                         s.verifyFailures);
+                }
+            }
+
+            for (RocksDatabase database : StoreRegistry.databases()) {
+                RocksDatabase.Snapshot d = database.snapshot();
+                StringBuilder cfs = new StringBuilder();
+                for (RocksDatabase.ColumnFamilySnapshot cf : d.columnFamilies) {
+                    cfs.append(' ').append(cf.columnFamily)
+                        .append("[sst=").append(cf.liveSstBytes)
+                        .append(" keys~").append(cf.estimatedKeys)
+                        .append(" memtable=").append(cf.memtableBytes)
+                        .append(" pendingCompaction=").append(cf.pendingCompactionBytes)
+                        .append(']');
+                }
+                LOGGER.info("stats db {}: stores={} blob={} blockCache={} "
+                        + "running={}c/{}f stalls={} stopped={}{}",
+                    d.database, d.openStores, d.blobFileBytes, d.blockCacheBytes,
+                    d.runningCompactions, d.runningFlushes, d.delayedWriteRate,
+                    d.writeStopped, cfs);
+
+                // Surface the two conditions that actually cause tick lag, rather
+                // than leaving an operator to spot them in a wall of numbers.
+                if (d.writeStopped > 0) {
+                    LOGGER.error("rocksmc: writes are STOPPED on {} -- compaction "
+                        + "cannot keep up. Raise max-background-jobs.", d.database);
+                } else if (d.delayedWriteRate > 0) {
+                    LOGGER.warn("rocksmc: writes are being throttled on {} to {} B/s.",
+                        d.database, d.delayedWriteRate);
                 }
             }
         } catch (RuntimeException e) {
@@ -158,7 +179,7 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "#\n"
             + "# backend: anvil | rocksdb\n"
             + "#   anvil   - vanilla region files (default, no behaviour change)\n"
-            + "#   rocksdb - RocksDB with key-value separation\n"
+            + "#   rocksdb - one RocksDB per world, with key-value separation\n"
             + "#\n"
             + "# WARNING: rocksdb does not write .mca files. Amulet, Chunker,\n"
             + "# BlueMap/Dynmap, pregenerators and world editors will not read the\n"
@@ -206,22 +227,30 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "# scarce resource is CPU competing with the tick loop, so these favour\n"
             + "# draining background work quickly and spreading writeback thinly.\n"
             + "#\n"
+            + "# These are per-WORLD, not per-dimension. One database serves every\n"
+            + "# dimension, so the memory figures below mean what they say. Before\n"
+            + "# that consolidation each of a world's six stores allocated its own,\n"
+            + "# silently multiplying every figure by six.\n"
+            + "#\n"
             + "# NOTE: these values are reasoned, not measured. Use the metrics below\n"
             + "# to correct them for your workload.\n"
             + "# ---------------------------------------------------------------------\n"
             + "\n"
-            + "# Background compaction and flush threads. RocksDB defaults to 2, sized\n"
-            + "# for spinning disks. Unfinished compaction eventually stalls writes on\n"
-            + "# the IO worker, so on NVMe/Optane it pays to drain it aggressively.\n"
+            + "# Background compaction and flush threads, per world. RocksDB defaults\n"
+            + "# to 2, sized for spinning disks. Unfinished compaction eventually\n"
+            + "# stalls writes on the IO worker, so on NVMe/Optane it pays to drain it\n"
+            + "# aggressively.\n"
             + "max-background-jobs=8\n"
             + "\n"
             + "# Splits a single large compaction across threads.\n"
             + "max-subcompactions=4\n"
             + "\n"
-            + "# Memtable size. The dominant write pattern is the same hot chunks being\n"
-            + "# saved repeatedly, so a larger memtable coalesces more of that before\n"
-            + "# anything reaches disk. 64 MiB.\n"
-            + "write-buffer-size=67108864\n"
+            + "# Memtable size, per column family (chunk and poi). The dominant write\n"
+            + "# pattern is the same hot chunks being saved repeatedly, so a larger\n"
+            + "# memtable coalesces more of that before anything reaches disk. All\n"
+            + "# dimensions share a column family, so worst case is this x\n"
+            + "# max-write-buffer-number x 2. 128 MiB.\n"
+            + "write-buffer-size=134217728\n"
             + "\n"
             + "# Memtables allowed before writes stall; absorbs autosave convoys.\n"
             + "max-write-buffer-number=4\n"
@@ -231,11 +260,11 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "# lands on the tick loop as a stall. 1 MiB.\n"
             + "bytes-per-sync=1048576\n"
             + "\n"
-            + "# Block cache for index and filter blocks. Note this does NOT cache\n"
-            + "# chunk values: those live in blob files, which RocksDB 10.x has no\n"
-            + "# per-column-family blob cache for, so chunk reads rely on this plus the\n"
-            + "# OS page cache. 256 MiB.\n"
-            + "block-cache-size=268435456\n"
+            + "# Block cache for index and filter blocks, one per world. Note this\n"
+            + "# does NOT cache chunk values: those live in blob files, which RocksDB\n"
+            + "# 10.x has no per-column-family blob cache for, so chunk reads rely on\n"
+            + "# this plus the OS page cache. 512 MiB.\n"
+            + "block-cache-size=536870912\n"
             + "\n"
             + "# L0 file count that begins throttling writes. Raised from RocksDB's\n"
             + "# default of 8: fast storage drains L0 quickly, so throttling early\n"

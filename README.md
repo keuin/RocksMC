@@ -28,9 +28,11 @@ weaknesses:
    them inconsistent with no mechanism to detect it.
 
 Item 1 is a **measured** win: RocksDB used **33.9% less disk** than Anvil on a real
-world. Item 4 has no filesystem-level workaround at all, but is not yet
-implemented — every `(dimension, leaf)` still gets its own database, which is itself
-a correctness problem (see the Phase 2 note under Roadmap).
+world. Item 4 has no filesystem-level workaround at all. It is now *partly*
+addressed: all dimensions share one database and therefore one write-ahead log, so
+recovery lands on a single point for the whole world — verified by four `kill -9`
+cycles mid-autosave. Genuine chunk-and-POI batching still does not exist, because
+those writes originate in independent `StorageIoWorker`s above this mod's seam.
 
 Item 2 is **not yet substantiated.** An earlier draft claimed RocksDB writes 0.32×
 vanilla's bytes; that figure excluded WAL traffic and came from a database too small
@@ -253,23 +255,31 @@ and a strict parity mode is retained.
 - [x] **Phase 1d** — replace path-derived dimension IDs with a persisted registry
 - [x] **Phase 1e** — beta hardening: format guard, blank-world guard, world
       importer, Prometheus exporter, periodic stats, perf knobs
-- [ ] **Phase 2** — **one database per world** (chunk + POI column families);
-      gives a single recovery point across dimensions
+- [x] **Phase 2** — **one database per world** (chunk + POI column families);
+      a single recovery point across all dimensions
 - [ ] **Phase 3** — `playerdata` + `state`
 - [ ] **Phase 4** — checkpoint-based recoverable snapshots
 - [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
 
 **Beta-capable, not production-ready.** See
 [`docs/beta-setup.md`](docs/beta-setup.md) for deployment, and the untested areas
-worth watching in the first week — chiefly POI (never exercised by a live server)
-and crash recovery (the WAL is replayable in principle, never verified).
+worth watching in the first week — chiefly POI, which no live server has yet
+exercised.
 
-⚠️ **Phase 2 is agreed to land before the beta**, because the current
-one-database-per-store layout cannot recover to a coherent cross-dimension state:
-each database has its own WAL, and vanilla saves worlds sequentially, so a crash
-mid-autosave recovers each dimension to a different point — a state no tick ever
-produced. That can duplicate or destroy an entity mid-teleport. See
-[`docs/known-limitations.md`](docs/known-limitations.md) L2 and
+Phase 2 landed because the previous one-database-per-store layout could not recover
+to a coherent cross-dimension state: each database had its own WAL, and vanilla
+saves worlds sequentially, so a crash mid-autosave recovered each dimension to a
+different point — a state no tick ever produced, which can duplicate or destroy an
+entity mid-teleport. All dimensions now share one WAL.
+
+Verified on the real 293,207-chunk world: four `kill -9` cycles mid-autosave, every
+dimension recovering to the **same** point every time, with all 293,207 entries
+intact afterwards. It also removed a live misconfiguration — options, block cache,
+bloom filter and thread pool were allocated *per store*, so a three-dimension world
+multiplied every memory setting by six.
+
+⚠️ One database gives one recovery point. It does **not** make a chunk write atomic
+with its POI write; see [`docs/known-limitations.md`](docs/known-limitations.md) and
 [`TODO.md`](TODO.md).
 
 ## Importing an existing world
@@ -279,8 +289,16 @@ produced. That can duplicate or destroy an entity mid-teleport. See
 ```
 
 Region files are opened **read-only** and never modified, so this is safe against
-a copy and reversible by deleting the `*.rocksdb` directories. Every chunk is read
-back and compared; the import exits non-zero rather than leaving a partial world.
+a copy and reversible by deleting `<world>/rocksmc.db`. Every chunk is read back
+and compared; the import exits non-zero rather than leaving a partial world.
+
+Everything goes into **one database per world**, `<world>/rocksmc.db`, with chunk
+and POI data in separate column families. Every dimension is converted in a single
+pass — importing only some of them and then starting a server would let the rest
+regenerate silently.
+
+Measured on a real 293,207-chunk world: **5m 41s**, all chunks verified, resulting
+database **33.9% smaller on disk** than the `.mca` files.
 
 Oversized `.mcc` chunks are handled — earlier tooling in this project skipped
 them, which would have silently dropped the largest chunks.
@@ -288,11 +306,30 @@ them, which would have silently dropped the largest chunks.
 Not imported, because vanilla reads them directly and they need no conversion:
 `level.dat`, `playerdata/`, `data/`, `advancements/`. **Backups must include them.**
 
+Databases written by builds before Phase 2 (one per `(dimension, leaf)`, at
+`<dir>.rocksdb`) cannot be opened; the server refuses to start and names the
+re-import command. The old directories are left untouched, so older builds and
+`backend=anvil` both still work.
+
 ## Metrics
 
 With `metrics-enabled=true`, Prometheus text format is served on
-`http://<bind>:<port>/metrics`, labelled by `dimension` and `store` so a technical
-server can be queried per dimension.
+`http://<bind>:<port>/metrics`.
+
+Series are emitted at **three scopes**, because one shared database means not every
+value belongs to a dimension:
+
+| Scope | Labels | Values |
+|---|---|---|
+| Store | `dimension`, `store`, `database` | IO counters the store owns: reads, writes, bytes, failures |
+| Column family (`_by_cf`) | `column_family`, `database` | SST bytes, key estimates, memtables, compaction backlog — all dimensions share a column family |
+| Database | `database` | Blob bytes, block cache, throttling, write stops |
+
+⚠️ Attaching the shared values to stores instead would report each once per store.
+Measured on the real world, that overstated on-disk size by **6×** and entry counts
+by **3×**, which is why the column-family metrics carry a `_by_cf` suffix rather
+than reusing the old per-store names: a stale query should break loudly instead of
+quietly aggregating the wrong scope.
 
 Built on the official `io.prometheus` client (1.8.0). Because stores open lazily —
 a dimension's store only exists once something loads that dimension — the metrics
@@ -311,27 +348,31 @@ datasource is a template variable rather than a hardcoded UID, so it imports cle
 into any environment; `instance` and `dimension` are selectable too. See
 [`dashboards/README.md`](dashboards/README.md).
 
-The four worth alerting on: `rocksmc_write_stopped` (any 1 is an incident),
-`rocksmc_delayed_write_rate`, `rocksmc_pending_compaction_bytes`, and
-`rocksmc_verify_failures_total` (must stay 0).
+Worth alerting on: `rocksmc_write_stopped` (any 1 is an incident),
+`rocksmc_delayed_write_rate`, `rocksmc_pending_compaction_bytes_by_cf`,
+`rocksmc_verify_failures_total` (must stay 0), and `rocksmc_databases > 1` (which
+would mean the shared-handle consolidation has broken).
 
 ## Risks
 
-- **Custom dimensions are not correctly addressed.** Dimension IDs are derived by
-  path matching, which only recognises the three vanilla dimensions. Every
-  datapack or mod dimension collides with the Overworld. Harmless today because
-  each store gets its own database, but **data-destroying once Phase 2 merges
-  them into one keyspace.** Must be fixed before Phase 2 — see
-  [`docs/known-limitations.md`](docs/known-limitations.md) (L1).
 - **Ecosystem lock-out.** `.mca` is the interchange format for Amulet, Chunker,
   BlueMap/Dynmap, pregenerators, and every world editor. The Phase 5 converter is
   mandatory, and will likely be more code than the storage layer it replaces.
-- **Widened blast radius.** Once `playerdata` is in scope, a storage bug risks
-  player inventories, not just terrain. Use throwaway worlds.
+- **One database is a single blast radius.** Consolidation bought a coherent
+  recovery point at the cost of putting every dimension behind one handle: a bug
+  that corrupts it now affects the whole world rather than one dimension. The
+  reference counting that keeps the handle alive until the last store closes is
+  therefore covered by dedicated tests, including concurrent open and double close.
+- **Chunk and POI still are not atomic together.** One WAL means one recovery
+  point, not one commit. A crash can still land between a chunk write and its POI
+  write.
+- **Widened blast radius ahead.** Once `playerdata` is in scope (Phase 3), a
+  storage bug risks player inventories, not just terrain. Use throwaway worlds.
 - **Native dependency.** `rocksdbjni` is ~50 MB of platform binaries; the mod is
   no longer pure-Java portable.
-- **Unmeasured baseline.** No real world was generated. Compression and
-  amplification figures come from synthetic corpora.
+- **Tuning values are reasoned, not measured.** Every unmeasured figure in this
+  project has so far turned out wrong; the defaults are a starting point that beta
+  telemetry should correct.
 
 See [`docs/known-limitations.md`](docs/known-limitations.md) for the full list of
 recorded design gaps.

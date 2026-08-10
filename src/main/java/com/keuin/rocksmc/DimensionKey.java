@@ -1,11 +1,12 @@
 package com.keuin.rocksmc;
 
 import java.io.File;
+import java.nio.file.Paths;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * A dimension's stable identity, derived from its save directory.
+ * A dimension's stable identity and world root, derived from its save directory.
  *
  * <h2>Why the directory, and not a {@code RegistryKey<World>}</h2>
  *
@@ -49,6 +50,10 @@ import java.util.regex.Pattern;
  * because {@code Identifier} permits {@code /} in the path component. So the
  * namespace is the first segment after {@code dimensions/} and the path is
  * everything after it, joined with {@code /}.
+ *
+ * <p>In every layout {@code <root>} is the world directory, which is why
+ * {@link #root()} can be read off the same match: it is the anchor that groups all
+ * of a world's storage directories onto one database.
  */
 public final class DimensionKey {
 
@@ -113,10 +118,12 @@ public final class DimensionKey {
 
     private final String identity;
     private final String leaf;
+    private final String root;
 
-    private DimensionKey(String identity, String leaf) {
+    private DimensionKey(String identity, String leaf, String root) {
         this.identity = identity;
         this.leaf = leaf;
+        this.root = root;
     }
 
     /**
@@ -130,6 +137,69 @@ public final class DimensionKey {
     /** Which store this directory belongs to: {@code region} or {@code poi}. */
     public String leaf() {
         return this.leaf;
+    }
+
+    /**
+     * The world root: the directory holding {@code level.dat}, above any
+     * {@code DIM-1} or {@code dimensions/...} segment.
+     *
+     * <p>This is what makes one database per world addressable. All six storage
+     * directories of a three-dimension world -- {@code <root>/region},
+     * {@code <root>/poi}, {@code <root>/DIM-1/region} and so on -- yield the same
+     * root, so they resolve to the same database.
+     *
+     * <p>Recovered from the same match that yields the identity rather than by
+     * counting {@code getParentFile()} calls, because the number of segments to
+     * climb differs per layout (one for the overworld, two for the nether, three or
+     * more for a custom dimension whose path may itself contain slashes). Deriving
+     * both from one regex means they cannot disagree.
+     *
+     * <p>Not canonicalised: this class is a pure function of its input string and
+     * must stay testable against paths that do not exist. Redundant {@code .} and
+     * {@code ..} segments are removed, though, because {@code getAbsolutePath()}
+     * leaves them in place -- a server launched with {@code ./world} would otherwise
+     * produce {@code /srv/./world/rocksmc.db} in log lines and error messages, which
+     * looks like a different path to an operator comparing them. Symlinks are
+     * resolved by {@link RocksDatabase#open}, which needs a true identity rather
+     * than a tidy one.
+     */
+    public File root() {
+        return new File(normalise(this.root));
+    }
+
+    /**
+     * Removes redundant path segments without touching the filesystem.
+     *
+     * <p>{@code Paths.get(...).normalize()} is purely lexical, so it works on paths
+     * that do not exist and cannot throw. It is skipped when the string contains no
+     * separator-adjacent dot at all, which is the overwhelmingly common case.
+     */
+    private static String normalise(String path) {
+        if (path.isEmpty()) {
+            return path;
+        }
+        try {
+            String normalised = Paths.get(path).normalize().toString();
+            // normalize() reduces a lone "/" to "", which would stop being absolute.
+            return normalised.isEmpty() ? path : normalised;
+        } catch (RuntimeException e) {
+            // An unparseable path (e.g. a NUL byte) is not worth failing over here;
+            // the caller will fail on it soon enough with a better message.
+            return path;
+        }
+    }
+
+    /**
+     * A copy addressing the same dimension and leaf under a different world root.
+     *
+     * <p>For harnesses that read a world in place but must not write into it: the
+     * source may be a read-only mirror, and leaving a database behind in it would
+     * be both surprising and, for the fidelity harness, a source of stale data on a
+     * later run. The identity and leaf are preserved, so the dimension ordinal and
+     * column family are exactly what the server would use.
+     */
+    public DimensionKey withRoot(File newRoot) {
+        return new DimensionKey(this.identity, this.leaf, newRoot.getPath());
     }
 
     /**
@@ -159,16 +229,34 @@ public final class DimensionKey {
         String leaf = m.group("leaf");
         String vanilla = m.group("vanilla");
         String namespace = m.group("namespace");
+        // An absolute path always begins with a separator, so the shortest input
+        // that can match ("/region") leaves root empty. Mapping that to the
+        // filesystem root keeps root() absolute; letting File("") through would
+        // silently resolve against the working directory instead.
+        String root = m.group("root");
+        if (root.isEmpty()) {
+            root = File.separator;
+        }
 
         if (vanilla != null) {
-            return new DimensionKey("DIM-1".equals(vanilla) ? THE_NETHER : THE_END, leaf);
+            return new DimensionKey(
+                "DIM-1".equals(vanilla) ? THE_NETHER : THE_END, leaf, root);
         }
         if (namespace != null) {
-            return new DimensionKey(namespace + ":" + m.group("path"), leaf);
+            return new DimensionKey(namespace + ":" + m.group("path"), leaf, root);
         }
-        return new DimensionKey(OVERWORLD, leaf);
+        return new DimensionKey(OVERWORLD, leaf, root);
     }
 
+    /**
+     * Equality covers the root as well as the identity and leaf.
+     *
+     * <p>Two keys with the same identity and leaf under different roots address
+     * <em>different databases</em>. Ignoring the root would make them compare
+     * equal, so a caller using this as a map key would silently conflate two
+     * separate worlds -- the same shape of bug as the dimension-identity collision
+     * this class was written to fix.
+     */
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -178,12 +266,16 @@ public final class DimensionKey {
             return false;
         }
         DimensionKey other = (DimensionKey)o;
-        return this.identity.equals(other.identity) && this.leaf.equals(other.leaf);
+        return this.identity.equals(other.identity)
+            && this.leaf.equals(other.leaf)
+            && this.root.equals(other.root);
     }
 
     @Override
     public int hashCode() {
-        return this.identity.hashCode() * 31 + this.leaf.hashCode();
+        int h = this.identity.hashCode();
+        h = h * 31 + this.leaf.hashCode();
+        return h * 31 + this.root.hashCode();
     }
 
     @Override

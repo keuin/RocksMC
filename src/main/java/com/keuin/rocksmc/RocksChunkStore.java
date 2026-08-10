@@ -3,20 +3,8 @@ package com.keuin.rocksmc;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.util.math.ChunkPos;
-import org.rocksdb.BlockBasedTableConfig;
-import org.rocksdb.BloomFilter;
-import org.rocksdb.Cache;
-import org.rocksdb.Checkpoint;
-import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.CompressionType;
-import org.rocksdb.DBOptions;
-import org.rocksdb.FlushOptions;
-import org.rocksdb.LRUCache;
-import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
-import org.rocksdb.WriteOptions;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -24,13 +12,20 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * A {@link ChunkStore} backed by RocksDB with key-value separation.
+ * A {@link ChunkStore} view over one dimension's slice of one column family.
+ *
+ * <p>Owns no native resources. The database handle, options, block cache, thread
+ * pool and dimension registry all belong to {@link RocksDatabase}, which is shared
+ * by every dimension and both leaves of a world -- see that class for why
+ * consolidation was necessary. This class contributes the key prefix, the NBT
+ * framing and its own IO counters, and nothing else.
+ *
+ * <p>Six of these exist for a three-dimension world, all pointing at one database.
+ * {@link #close()} therefore releases a reference rather than closing anything;
+ * only the last one closes the handle.
  *
  * <h2>Design notes, with the measurements behind them</h2>
  *
@@ -60,7 +55,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * configuration measured 14.07x, i.e. about 3.5% larger on disk. The reason to
  * do it anyway is bytes written: vanilla rewrites the entire 8 KiB region header
  * on every chunk save, which for a mean 3.5 KiB compressed chunk is roughly 70%
- * of its write volume. RocksDB measured 0.32x vanilla bytes written.
+ * of its write volume.
  *
  * <p><b>ZSTD, not LZ4.</b> LZ4 measured 9.25x against ZSTD's 13.93x on real
  * chunks -- about 57% more disk. An earlier plan to prefer LZ4 "for speed" was
@@ -72,45 +67,29 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Key encoding</h2>
  *
- * <p>{@code dimension(4B) | mortonZ(x,z)(8B)}, big-endian. Interleaving the
- * chunk coordinates preserves 2D locality in RocksDB's 1D ordered keyspace, so a
- * player walking through the world produces near-sequential access and compaction
- * keeps neighbouring chunks together.
+ * <p>{@code dimension(4B) | mortonZ(x,z)(8B)}, big-endian. The dimension prefix is
+ * load-bearing now that dimensions share a column family: it is the only thing
+ * separating one dimension's chunks from another's. Putting it first also keeps
+ * each dimension in a contiguous key range, which is what would make a future
+ * per-dimension {@code DeleteRange} or bulk export cheap.
+ *
+ * <p>Interleaving the chunk coordinates preserves 2D locality in RocksDB's 1D
+ * ordered keyspace, so a player walking through the world produces
+ * near-sequential access and compaction keeps neighbouring chunks together.
  *
  * <p>Not thread-safe, matching the seam contract: vanilla serialises all access
  * through one {@code TaskExecutor} per storage instance.
  */
 public final class RocksChunkStore implements ChunkStore {
 
-    static {
-        RocksDB.loadLibrary();
-    }
-
-    /** Bumped if the key encoding or value framing ever changes. */
-    private static final int FORMAT_VERSION = 1;
-
-    /**
-     * Meta-CF key holding the on-disk format version.
-     *
-     * <p>Prefixed with NUL so it can never collide with a dimension identity, which
-     * is always a printable namespaced string.
-     */
-    private static final String FORMAT_VERSION_KEY = "\u0000format";
-
-    private final RocksDB db;
-    private final DBOptions dbOptions;
-    private final ColumnFamilyOptions defaultCfOptions;
-    private final ColumnFamilyOptions metaCfOptions;
-    private final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
-    private final WriteOptions writeOptions;
-    private final BloomFilter bloomFilter;
-    private final Cache blockCache;
-    private final File path;
-    private final DimensionRegistry dimensionRegistry;
+    private final RocksDatabase database;
+    private final ColumnFamilyHandle columnFamily;
+    private final String columnFamilyName;
     private final String dimensionIdentity;
     private final String leaf;
     private final int dimensionId;
     private final boolean verifyOnRead;
+    private boolean closed;
 
     private final AtomicLong reads = new AtomicLong();
     private final AtomicLong writes = new AtomicLong();
@@ -121,147 +100,51 @@ public final class RocksChunkStore implements ChunkStore {
     private final AtomicLong verifyFailures = new AtomicLong();
 
     /**
-     * @param path     database directory; created if absent
-     * @param dimension the dimension whose chunks this store holds, derived from
-     *                  the save directory rather than guessed from a path prefix
-     * @param config   tuning; see {@link RocksMcConfig}
+     * Opens a view onto the world's shared database, opening that database if this
+     * is the first store to need it.
+     *
+     * <p>This is the only constructor callers should use: taking the reference and
+     * building the view together means the reference cannot be leaked by a failure
+     * in between.
+     *
+     * @param dimension which dimension and leaf this store serves, and which world
+     *                  it belongs to -- all derived from the save directory rather
+     *                  than guessed from a path prefix
      */
-    public RocksChunkStore(File path, DimensionKey dimension, RocksMcConfig config)
+    public static RocksChunkStore open(DimensionKey dimension, RocksMcConfig config)
             throws IOException {
-        this.path = path;
+        RocksDatabase database = RocksDatabase.open(dimension.root(), config);
+        try {
+            return new RocksChunkStore(database, dimension, config);
+        } catch (IOException | RuntimeException e) {
+            // The reference was taken above, so it must be given back or the
+            // database would never close.
+            try {
+                database.release();
+            } catch (IOException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        }
+    }
+
+    private RocksChunkStore(RocksDatabase database, DimensionKey dimension,
+            RocksMcConfig config) throws IOException {
+        this.database = database;
+        this.columnFamilyName = RocksDatabase.columnFamilyNameFor(dimension.leaf());
+        this.columnFamily = database.columnFamilyFor(dimension.leaf());
         this.dimensionIdentity = dimension.identity();
         this.leaf = dimension.leaf();
         this.verifyOnRead = config.verifyOnRead();
-
-        if (!path.exists() && !path.mkdirs()) {
-            throw new IOException("Could not create RocksDB directory: " + path);
-        }
-
-        this.bloomFilter = new BloomFilter(10);
-        this.blockCache = new LRUCache(config.blockCacheSize());
-        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
-            .setFilterPolicy(this.bloomFilter)
-            .setBlockCache(this.blockCache)
-            // Chunk reads are single-key point lookups, never scans, so bias the
-            // index for lookup speed.
-            .setCacheIndexAndFilterBlocks(true)
-            .setPinL0FilterAndIndexBlocksInCache(true);
-
-        this.defaultCfOptions = new ColumnFamilyOptions()
-            .setCompressionType(CompressionType.ZSTD_COMPRESSION)
-            .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
-            .setTableFormatConfig(tableConfig)
-            // Key-value separation. Chunk values are tens of KiB, so without this
-            // leveled compaction would rewrite them repeatedly.
-            .setEnableBlobFiles(true)
-            .setMinBlobSize(config.minBlobSize())
-            .setBlobCompressionType(CompressionType.ZSTD_COMPRESSION)
-            .setEnableBlobGarbageCollection(true)
-            // Reclaim space from overwritten blobs rather than growing without
-            // bound, which is precisely the failure mode Anvil's never-compacted
-            // sector allocator has.
-            .setBlobGarbageCollectionAgeCutoff(0.25)
-            .setBlobGarbageCollectionForceThreshold(0.5)
-            // Larger memtables coalesce more repeated saves of the same hot chunk
-            // before any of it reaches disk, which is the dominant write pattern on
-            // a technical server.
-            .setWriteBufferSize(config.writeBufferSize())
-            .setMaxWriteBufferNumber(config.maxWriteBufferNumber())
-            // Raised from the default 8: fast storage drains L0 quickly, so
-            // throttling writes early costs tick time for no benefit.
-            .setLevel0SlowdownWritesTrigger(config.level0SlowdownTrigger());
-
-        // The dimension registry holds a handful of tiny entries. Blob files and
-        // heavy compression would be pure overhead there.
-        this.metaCfOptions = new ColumnFamilyOptions()
-            .setCompressionType(CompressionType.NO_COMPRESSION);
-
-        this.dbOptions = new DBOptions()
-            .setCreateIfMissing(true)
-            .setCreateMissingColumnFamilies(true)
-            .setMaxBackgroundJobs(config.maxBackgroundJobs())
-            .setMaxSubcompactions(config.maxSubcompactions())
-            // Trickle writeback out in small increments instead of letting it pile
-            // up until file close, which otherwise shows up as a tick stall.
-            .setBytesPerSync(config.bytesPerSync())
-            .setWalBytesPerSync(config.bytesPerSync());
-
-        this.writeOptions = new WriteOptions().setSync(config.syncWrites());
-
-        List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
-        descriptors.add(new ColumnFamilyDescriptor(
-            RocksDB.DEFAULT_COLUMN_FAMILY, this.defaultCfOptions));
-        descriptors.add(new ColumnFamilyDescriptor(
-            DimensionRegistry.CF_NAME.getBytes(StandardCharsets.UTF_8), this.metaCfOptions));
-
-        try {
-            this.db = RocksDB.open(this.dbOptions, path.getAbsolutePath(),
-                descriptors, this.cfHandles);
-        } catch (RocksDBException e) {
-            closeQuietly();
-            throw new IOException("Failed to open RocksDB at " + path, e);
-        }
-
-        try {
-            this.dimensionRegistry = new DimensionRegistry(this.db, this.cfHandles.get(1));
-            // Before anything is read or written, confirm the on-disk layout is one
-            // this build understands. Without this an encoding change would silently
-            // reinterpret existing keys, which is unrecoverable.
-            checkFormatVersion();
-            this.dimensionId = this.dimensionRegistry.ordinalFor(this.dimensionIdentity);
-        } catch (IOException e) {
-            // An unusable registry means keys cannot be interpreted, so refuse to
-            // serve rather than write chunks under an unknown dimension id.
-            this.db.close();
-            closeQuietly();
-            throw e;
-        }
-
+        this.dimensionId = database.dimensionRegistry().ordinalFor(this.dimensionIdentity);
         StoreRegistry.register(this);
-    }
-
-    /**
-     * Reads, or on first open writes, the on-disk format version.
-     *
-     * <p>{@link #FORMAT_VERSION} covers the key encoding and value framing. A
-     * database written by a different version cannot be read safely, so a mismatch
-     * aborts rather than guessing. There is no migration: the mod is alpha and
-     * worlds are expected to be rebuilt.
-     */
-    private void checkFormatVersion() throws IOException {
-        byte[] key = FORMAT_VERSION_KEY.getBytes(StandardCharsets.UTF_8);
-        ColumnFamilyHandle meta = this.cfHandles.get(1);
-        try {
-            byte[] stored = this.db.get(meta, key);
-            if (stored == null) {
-                this.db.put(meta, key, String.valueOf(FORMAT_VERSION)
-                    .getBytes(StandardCharsets.UTF_8));
-                return;
-            }
-            int found = Integer.parseInt(new String(stored, StandardCharsets.UTF_8).trim());
-            if (found != FORMAT_VERSION) {
-                throw new IOException("rocksmc: database at " + this.path
-                    + " was written with on-disk format version " + found
-                    + ", but this build only understands version " + FORMAT_VERSION
-                    + ". There is no migration path; the world must be re-imported.");
-            }
-        } catch (RocksDBException e) {
-            throw new IOException("failed to read format version at " + this.path, e);
-        } catch (NumberFormatException e) {
-            throw new IOException("corrupt format version marker at " + this.path, e);
-        }
-    }
-
-    /** The column family holding chunk data. */
-    private ColumnFamilyHandle dataCf() {
-        return this.cfHandles.get(0);
     }
 
     @Override
     public NbtCompound read(ChunkPos pos) throws IOException {
         byte[] value;
         try {
-            value = this.db.get(dataCf(), key(this.dimensionId, pos));
+            value = this.database.handle().get(this.columnFamily, key(this.dimensionId, pos));
         } catch (RocksDBException e) {
             this.readFailures.incrementAndGet();
             throw new IOException("RocksDB read failed for " + pos, e);
@@ -289,7 +172,8 @@ public final class RocksChunkStore implements ChunkStore {
         byte[] chunkKey = key(this.dimensionId, pos);
 
         try {
-            this.db.put(dataCf(), this.writeOptions, chunkKey, value);
+            this.database.handle().put(this.columnFamily, this.database.writeOptions(),
+                chunkKey, value);
         } catch (RocksDBException e) {
             this.writeFailures.incrementAndGet();
             throw new IOException("RocksDB write failed for " + pos, e);
@@ -318,7 +202,7 @@ public final class RocksChunkStore implements ChunkStore {
             throws IOException {
         byte[] actual;
         try {
-            actual = this.db.get(dataCf(), chunkKey);
+            actual = this.database.handle().get(this.columnFamily, chunkKey);
         } catch (RocksDBException e) {
             this.verifyFailures.incrementAndGet();
             throw new IOException("verify-on-read: could not re-read " + pos, e);
@@ -336,49 +220,22 @@ public final class RocksChunkStore implements ChunkStore {
         }
     }
 
+    /**
+     * Makes prior writes durable, by syncing the shared WAL.
+     *
+     * <p>Vanilla calls this once per storage instance per autosave -- six times for
+     * a three-dimension world -- and all six now reach the same WAL. It does not
+     * flush memtables; see {@link RocksDatabase#syncWal()} for why that would cost
+     * compaction work for no durability gain.
+     */
     @Override
     public void sync() throws IOException {
-        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
-            this.db.flush(flushOptions);
-            // Flush alone leaves the WAL unsynced when setSync(false) is in use.
-            this.db.flushWal(true);
-        } catch (RocksDBException e) {
-            throw new IOException("RocksDB flush failed", e);
-        }
+        this.database.syncWal();
     }
 
-    /**
-     * Compacts the whole keyspace, merging L0 files and collecting obsolete blobs.
-     *
-     * <p>Not something the server needs -- RocksDB compacts in the background --
-     * but measurement harnesses must call it before sizing the database. Without
-     * it, un-merged L0 files and unreferenced blobs remain on disk and inflate the
-     * apparent footprint.
-     */
-    public void compact() throws IOException {
-        try {
-            this.db.compactRange();
-        } catch (RocksDBException e) {
-            throw new IOException("RocksDB compaction failed", e);
-        }
-    }
-
-    /**
-     * Creates a consistent, application-level snapshot via hard links.
-     *
-     * <p>This is the capability Anvil cannot offer at all. A filesystem snapshot
-     * of a live Anvil world is only crash-consistent and may capture a torn 8 KiB
-     * header, which -- with no write-ahead log -- is silently unrecoverable. A
-     * checkpoint here is consistent by construction and needs no server pause.
-     *
-     * @param target destination directory; must not already exist
-     */
-    public void checkpoint(File target) throws IOException {
-        try (Checkpoint cp = Checkpoint.create(this.db)) {
-            cp.createCheckpoint(target.getAbsolutePath());
-        } catch (RocksDBException e) {
-            throw new IOException("Checkpoint to " + target + " failed", e);
-        }
+    /** The shared database this store is a view onto. */
+    public RocksDatabase database() {
+        return this.database;
     }
 
     /**
@@ -424,10 +281,10 @@ public final class RocksChunkStore implements ChunkStore {
 
     public String statsSummary() {
         return String.format(
-            "rocksmc[%s %s ord=%d]: reads=%d (%d B), writes=%d (%d B), formatVersion=%d",
-            this.path.getName(), this.dimensionIdentity, this.dimensionId,
-            this.reads.get(), this.bytesRead.get(),
-            this.writes.get(), this.bytesWritten.get(), FORMAT_VERSION);
+            "rocksmc[%s %s/%s ord=%d]: reads=%d (%d B), writes=%d (%d B)",
+            this.database.name(), this.dimensionIdentity, this.columnFamilyName,
+            this.dimensionId, this.reads.get(), this.bytesRead.get(),
+            this.writes.get(), this.bytesWritten.get());
     }
 
     /** The dimension this store holds, e.g. {@code twilightforest:twilight_forest}. */
@@ -442,26 +299,27 @@ public final class RocksChunkStore implements ChunkStore {
 
     /** Visible for tests: the persisted identity-to-ordinal mapping. */
     public DimensionRegistry dimensionRegistry() {
-        return this.dimensionRegistry;
-    }
-
-    public long liveDataSize() {
-        return longProperty("rocksdb.live-sst-files-size");
+        return this.database.dimensionRegistry();
     }
 
     /**
-     * A point-in-time view of this store, for logging and metrics.
+     * A point-in-time view of this store's own IO, for logging and metrics.
      *
-     * <p>Read under no lock: the counters are atomics and the RocksDB properties
-     * are already approximate, so a scrape never blocks the IO worker. Values may
-     * be very slightly inconsistent with each other, which is the right trade for
-     * observability.
+     * <p>Only counters this store genuinely owns. Everything shared -- SST sizes,
+     * key estimates, compaction state, the block cache -- belongs to the column
+     * family or the database and is reported by {@link RocksDatabase#snapshot()}
+     * instead. Reporting those here would emit the same number once per store and
+     * make any aggregate six times too large.
+     *
+     * <p>Read under no lock: the counters are atomics, so a scrape never blocks the
+     * IO worker.
      */
     public Snapshot snapshot() {
         return new Snapshot(
-            this.path.getName(),
+            this.database.name(),
             this.dimensionIdentity,
             this.leaf,
+            this.columnFamilyName,
             this.dimensionId,
             this.reads.get(),
             this.writes.get(),
@@ -469,54 +327,15 @@ public final class RocksChunkStore implements ChunkStore {
             this.bytesWritten.get(),
             this.readFailures.get(),
             this.writeFailures.get(),
-            this.verifyFailures.get(),
-            longProperty("rocksdb.live-sst-files-size"),
-            longProperty("rocksdb.total-sst-files-size"),
-            longProperty("rocksdb.estimate-num-keys"),
-            longProperty("rocksdb.estimate-pending-compaction-bytes"),
-            longProperty("rocksdb.num-running-compactions"),
-            longProperty("rocksdb.num-running-flushes"),
-            longProperty("rocksdb.mem-table-flush-pending"),
-            longProperty("rocksdb.compaction-pending"),
-            longProperty("rocksdb.actual-delayed-write-rate"),
-            longProperty("rocksdb.is-write-stopped"),
-            longProperty("rocksdb.block-cache-usage"),
-            longProperty("rocksdb.size-all-mem-tables"),
-            blobFileBytes());
+            this.verifyFailures.get());
     }
 
-    private long longProperty(String name) {
-        try {
-            return this.db.getLongProperty(name);
-        } catch (RocksDBException e) {
-            return -1L;
-        }
-    }
-
-    /**
-     * Total size of blob files on disk.
-     *
-     * <p>RocksDB exposes no property for this, and blob storage is where nearly all
-     * chunk bytes live, so it is measured from the filesystem. Cheap: a handful of
-     * large files per store.
-     */
-    private long blobFileBytes() {
-        File[] files = this.path.listFiles((d, n) -> n.endsWith(".blob"));
-        if (files == null) {
-            return -1L;
-        }
-        long total = 0L;
-        for (File f : files) {
-            total += f.length();
-        }
-        return total;
-    }
-
-    /** Immutable metrics view. Field names map directly onto metric names. */
+    /** Immutable per-store metrics view. Field names map onto metric names. */
     public static final class Snapshot {
         public final String database;
         public final String dimension;
         public final String leaf;
+        public final String columnFamily;
         public final int dimensionOrdinal;
         public final long reads;
         public final long writes;
@@ -525,31 +344,15 @@ public final class RocksChunkStore implements ChunkStore {
         public final long readFailures;
         public final long writeFailures;
         public final long verifyFailures;
-        public final long liveSstBytes;
-        public final long totalSstBytes;
-        public final long estimatedKeys;
-        public final long pendingCompactionBytes;
-        public final long runningCompactions;
-        public final long runningFlushes;
-        public final long memtableFlushPending;
-        public final long compactionPending;
-        public final long delayedWriteRate;
-        public final long writeStopped;
-        public final long blockCacheBytes;
-        public final long memtableBytes;
-        public final long blobFileBytes;
 
-        Snapshot(String database, String dimension, String leaf, int dimensionOrdinal,
-                long reads, long writes, long bytesRead, long bytesWritten,
-                long readFailures, long writeFailures, long verifyFailures,
-                long liveSstBytes, long totalSstBytes, long estimatedKeys,
-                long pendingCompactionBytes, long runningCompactions, long runningFlushes,
-                long memtableFlushPending, long compactionPending, long delayedWriteRate,
-                long writeStopped, long blockCacheBytes, long memtableBytes,
-                long blobFileBytes) {
+        Snapshot(String database, String dimension, String leaf, String columnFamily,
+                int dimensionOrdinal, long reads, long writes, long bytesRead,
+                long bytesWritten, long readFailures, long writeFailures,
+                long verifyFailures) {
             this.database = database;
             this.dimension = dimension;
             this.leaf = leaf;
+            this.columnFamily = columnFamily;
             this.dimensionOrdinal = dimensionOrdinal;
             this.reads = reads;
             this.writes = writes;
@@ -558,65 +361,24 @@ public final class RocksChunkStore implements ChunkStore {
             this.readFailures = readFailures;
             this.writeFailures = writeFailures;
             this.verifyFailures = verifyFailures;
-            this.liveSstBytes = liveSstBytes;
-            this.totalSstBytes = totalSstBytes;
-            this.estimatedKeys = estimatedKeys;
-            this.pendingCompactionBytes = pendingCompactionBytes;
-            this.runningCompactions = runningCompactions;
-            this.runningFlushes = runningFlushes;
-            this.memtableFlushPending = memtableFlushPending;
-            this.compactionPending = compactionPending;
-            this.delayedWriteRate = delayedWriteRate;
-            this.writeStopped = writeStopped;
-            this.blockCacheBytes = blockCacheBytes;
-            this.memtableBytes = memtableBytes;
-            this.blobFileBytes = blobFileBytes;
         }
     }
 
+    /**
+     * Deregisters this view and drops its reference to the shared database.
+     *
+     * <p>Does not close the database unless this was the last store using it. The
+     * guard against a second close is what keeps a double-close from decrementing
+     * the shared count twice and releasing the handle while other dimensions are
+     * still serving reads.
+     */
     @Override
     public void close() throws IOException {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
         StoreRegistry.deregister(this);
-        IOException failure = null;
-        try {
-            sync();
-        } catch (IOException e) {
-            failure = e;
-        }
-        // Column family handles must be released before the database itself.
-        for (ColumnFamilyHandle handle : this.cfHandles) {
-            handle.close();
-        }
-        this.cfHandles.clear();
-        if (this.db != null) {
-            this.db.close();
-        }
-        closeQuietly();
-        if (failure != null) {
-            throw failure;
-        }
-    }
-
-    private void closeQuietly() {
-        if (this.writeOptions != null) {
-            this.writeOptions.close();
-        }
-        if (this.dbOptions != null) {
-            this.dbOptions.close();
-        }
-        if (this.defaultCfOptions != null) {
-            this.defaultCfOptions.close();
-        }
-        if (this.metaCfOptions != null) {
-            this.metaCfOptions.close();
-        }
-        if (this.bloomFilter != null) {
-            this.bloomFilter.close();
-        }
-        // Released after the options that reference it, or RocksDB may touch a
-        // freed cache during teardown.
-        if (this.blockCache != null) {
-            this.blockCache.close();
-        }
+        this.database.release();
     }
 }

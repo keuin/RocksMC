@@ -119,7 +119,7 @@ public final class FidelityHarness {
      * Runs the round trip over every region file under {@code regionDir}.
      *
      * @param regionDir  directory containing {@code r.X.Z.mca}
-     * @param scratchDb  a fresh directory for the temporary RocksDB
+     * @param scratchDb  a fresh directory to hold the temporary database
      * @param limit      stop after this many chunks, or 0 for no limit
      */
     public static Stats run(File regionDir, File scratchDb, int limit) throws IOException {
@@ -148,8 +148,13 @@ public final class FidelityHarness {
         // Parse the dimension from the real directory rather than hardcoding an
         // ordinal, so the harness exercises the same identity path the server does
         // -- including for custom dimensions.
-        DimensionKey dimension = DimensionKey.fromStorageDirectory(regionDir);
-        try (RocksChunkStore store = new RocksChunkStore(scratchDb, dimension, config)) {
+        DimensionKey source = DimensionKey.fromStorageDirectory(regionDir);
+        // Redirect the database into the scratch directory rather than writing it
+        // beside the world being measured. The world may be a read-only mirror, and
+        // the harness must not leave anything behind in it.
+        DimensionKey dimension = source.withRoot(scratchDb);
+
+        try (RocksChunkStore store = RocksChunkStore.open(dimension, config)) {
             outer:
             for (File region : regions) {
                 for (RawChunk chunk : readRegion(region)) {
@@ -181,13 +186,15 @@ public final class FidelityHarness {
                     }
                 }
             }
-            // Compact before measuring. sync() alone leaves un-merged L0 files and
-            // obsolete blobs on disk, which inflates the footprint and would bias
-            // the size comparison against RocksDB. The Phase 0/1a spikes all
-            // compacted first, so this keeps the methodology consistent.
-            store.sync();
-            store.compact();
-            stats.rocksOnDisk = directorySize(scratchDb, ".sst") + directorySize(scratchDb, ".blob");
+            // Compact before measuring. A WAL sync alone leaves everything in
+            // memtables, and flushing alone leaves un-merged L0 files and obsolete
+            // blobs on disk, which inflates the footprint and would bias the size
+            // comparison against RocksDB. The Phase 0/1a spikes all compacted
+            // first, so this keeps the methodology consistent.
+            store.database().flushMemtables();
+            store.database().compact();
+            stats.rocksOnDisk = directorySize(store.database().path(), ".sst")
+                + directorySize(store.database().path(), ".blob");
         }
         return stats;
     }

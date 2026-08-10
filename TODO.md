@@ -5,142 +5,87 @@ as well as the steps.
 
 ---
 
-## Phase 2 — consolidate to one database per world
+## ✅ Phase 2 — consolidate to one database per world (DONE)
 
-**Status:** planned, not started
-**Blocks:** the beta rollout (agreed to land this first)
-**Estimated:** ~300–400 LOC, mostly splitting `RocksChunkStore`
+**Status:** delivered and verified on the real world
+**Was blocking:** the beta rollout
 
-### Why: separate databases cannot recover to a coherent state
+One RocksDB per world at `<world>/rocksmc.db`, shared by all dimensions and both
+storage leaves, with `chunk` and `poi` column families and metadata in `default`.
+`RocksDatabase` owns the handle and is reference counted; `RocksChunkStore` is now a
+thin view over `(database, columnFamily, dimensionOrdinal)` owning no native
+resources.
 
-`MinecraftServer.save()` (decompiled tree, `server/MinecraftServer.java:538-556`)
-iterates worlds **sequentially** — Overworld, then Nether, then End — calling
-`serverWorld.save(...)` on each independently.
+### What it fixes
 
-With one RocksDB per `(dimension, leaf)`, each database has its own write-ahead log
-and its own group-commit boundary. A crash part-way through an autosave therefore
-recovers each database to a *different* point in that sequence. Minecraft has a
-single tick loop for all dimensions, so there is no tick at which the Overworld had
-finished saving but the Nether had not. **Recovery lands on a state no tick ever
-produced.**
+Separate databases each had their own write-ahead log, and `MinecraftServer.save()`
+iterates worlds **sequentially**, so a crash mid-autosave recovered each dimension
+to a different point in that sequence — a state no tick ever produced, capable of
+duplicating or destroying an entity mid-teleport. One WAL means one recovery point.
 
-Verified cross-dimension coupling that this can tear:
+It also removed a live misconfiguration: options, block cache, bloom filter and
+thread pool were allocated **per store**, so a three-dimension world multiplied every
+memory setting by six. A documented 512 MiB block cache really meant ~3 GiB. These
+are now per-world and the defaults were raised back to their intended values.
 
-| Coupling | Location | Torn outcome |
-|---|---|---|
-| Entity teleport between dimensions | `entity/Entity.java:2050-2054` (`moveToWorld`) | Entity present in **both** worlds (duplication — an item/mob dupe created by crash recovery) or in **neither** (loss) |
-| Nether portal linkage | `entity/Entity.java:1668` | Paired portal survives on one side only |
-| Map item data | `server/world/ServerWorld.java:1204-1210` | **All** map state routes through the *Overworld's* `PersistentStateManager` regardless of which dimension the map depicts, so a Nether map already depends on Overworld storage |
+### Verification results
 
-### Secondary motive: per-store resource duplication
-
-`RocksChunkStore` allocates resources **per store**, not per world
-(`RocksChunkStore.java:140-141`, `:168-182`). With six stores open (region + poi ×
-three dimensions) the beta configuration currently multiplies out to:
-
-- `block-cache-size=512 MiB` × 6 = **~3 GB** of block cache, where 512 MB was
-  intended
-- `write-buffer-size=128 MiB` × `max-write-buffer-number=6` × 6 stores = up to
-  **~4.6 GB** of memtables
-- `max-background-jobs=8` × 6 = **48** background threads
-
-This is a live misconfiguration in `docs/beta-setup.md`, corrected there in the
-same commit that recorded this plan. Consolidation fixes it structurally rather
-than by lowering numbers.
-
-### ⚠️ What one database does and does not give
-
-**Does:** one WAL and therefore one recovery point across all dimensions. That
-alone eliminates the "no tick produced this" class of corruption. It also makes
-Phase 4 checkpoints world-wide rather than per-dimension, which is the only way
-that snapshot story actually works.
-
-**Does not:** make chunk and POI writes atomic with respect to each other. RocksDB
-guarantees atomicity per `WriteBatch`, not across separate `put` calls. Vanilla's
-writes originate in independent `StorageIoWorker` instances that flush on their own
-schedule, above the four-method seam this mod injects at. Batching them requires
-intercepting at a higher level — recorded below as follow-up, **not** delivered by
-this phase. Do not claim atomic cross-subsystem commits on the strength of
-consolidation alone.
-
-### Design
-
-**One database per world root**, at `<world>/rocksmc.db`.
-
-The world root is already captured by `DimensionKey`'s regex as the `root` group
-(`DimensionKey.java:109`) but is not currently exposed — add an accessor rather
-than re-deriving it.
-
-**Three column families:**
-
-| CF | Contents | Notes |
-|---|---|---|
-| `default` | format version, dimension registry | as today |
-| `chunk` | all dimensions' chunk NBT | blob files on |
-| `poi` | all dimensions' POI NBT | blob/LSM per size |
-
-Deliberately **not** one column family per dimension: each CF carries its own
-memtable, which would reproduce the duplication being removed.
-
-**Key encoding unchanged:** `dimOrdinal(4B) | morton(x,z)(8B)`, 12 bytes total.
-This resolves the earlier question about whether `dimensionId` is redundant — under
-one shared database it becomes load-bearing. Dimension-first ordering also keeps
-each dimension's chunks in a contiguous key range, which is what would make a
-future per-dimension `DeleteRange` or bulk export cheap.
-
-**New `RocksDatabase` class** owns the `RocksDB` handle, `DBOptions`, the shared
-`LRUCache`, the `BloomFilter` and the `DimensionRegistry`. Reference-counted,
-keyed by canonical world path. `RocksChunkStore` becomes a thin view over
-`(database, columnFamily, dimensionOrdinal)`.
-
-### ⚠️ Principal risk: shared handle lifecycle
-
-Six `RegionBasedStorage` instances will share one `RocksDB` handle. Only the last
-`close()` may release it; releasing early corrupts every dimension at once.
-
-The mixin's `close` injection (`RegionBasedStorageMixin.java:184-194`) is a clean
-single choke point, so refcounting is tractable — but it needs an explicit counter
-and a dedicated test, not an assumption about call order.
-
-### Migration
-
-Bump `FORMAT_VERSION` 1 → 2. **No in-place migration** — the mod is alpha and the
-world is backed up:
-
-- `importWorld` writes the new layout directly
-- opening a v1 database aborts with a message naming the re-import command
-  (the existing format guard already does this; only the constant changes)
-- old `*.rocksdb` directories are left untouched, so `backend=anvil` rollback is
-  unaffected
-
-### Steps
-
-1. Expose `root` on `DimensionKey`; add a test for each of the four layouts
-2. Write `RocksDatabase` with refcounting; test open/close ordering in isolation
-   **before** wiring anything to it
-3. Reduce `RocksChunkStore` to a view; keep the public surface
-   (`read`/`write`/`sync`/`close`/`snapshot`) unchanged so metrics and the
-   dashboard need no edits
-4. Update the mixin to resolve `(world root, leaf)` → shared database + CF
-5. Bump `FORMAT_VERSION` to 2
-6. Update `WorldImporter` for the single-database layout
-7. Correct the tuning defaults in `RocksMcConfig` and the generated config
-   template, now that resources are genuinely shared
-8. Verification (below)
-9. Update `docs/beta-setup.md`, `README.md`, `docs/storage-io-analysis.md`
-
-### Verification
-
-| Check | Requirement |
+| Check | Result |
 |---|---|
-| Existing tests | all 38 still pass |
-| New: refcounted lifecycle | handle survives until the last store closes |
-| New: per-dimension isolation | two dimensions in one CF never alias |
-| New: v1 rejection | opening a v1 database aborts with the re-import hint |
-| Re-import + fidelity on the real world | **293,207 / 293,207**, zero mismatches |
-| Dev server | 6 stores share one handle; metrics still emit 6 store series |
-| **`kill -9` mid-autosave** | **single recovery point across dimensions** — the entire point of this phase, so this test is mandatory rather than optional |
-| Memory | one block cache, not six |
+| Unit tests | **75 pass** (was 38) |
+| Refcounted lifecycle | handle survives until the last store closes; close order irrelevant; double close absorbed; over-release throws; concurrent open shares one handle |
+| Per-dimension isolation | chunk (0,0) in all three dimensions returns three different chunks, on real data |
+| Chunk/POI isolation | same ordinal, same position, different column families, no aliasing |
+| v1 rejection | refused with the re-import command named; verified live on the old dev world |
+| Re-import + fidelity | **293,207 / 293,207**, zero mismatches, −33.9% vs Anvil on disk |
+| Dev server | 6 stores, 1 handle, 1 path; metrics emit 6 / 2 / 1 series per scope |
+| **`kill -9` mid-autosave** | **4 cycles, uniform recovery every time**, 293,207 entries intact afterwards |
+| Memory | one block cache, one thread pool, two memtable sets |
+
+### Deviations from the original plan, and why
+
+1. **Metrics were re-scoped rather than left alone.** The plan said to keep
+   `RocksChunkStore`'s surface unchanged so the dashboard needed no edits. That was
+   wrong: half of `Snapshot`'s fields were database- or column-family-scoped, so
+   emitting them per store reported shared values six times. Measured on the real
+   world, the old names would have shown **6.40 GiB** on-disk and **881,208** entries
+   against a true 1.1 GiB and 293,207. Column-family metrics now carry a `_by_cf`
+   suffix so stale queries break loudly instead of quietly aggregating the wrong
+   scope.
+2. **`sync()` syncs the WAL instead of flushing memtables.** Vanilla calls it once
+   per storage instance per autosave — six times for a three-dimension world — and
+   all six now reach one database. Flushing there would cut every memtable short six
+   times an autosave, producing tiny L0 files and compaction work to merge them, for
+   no durability gain: durability comes from the WAL. `flushMemtables()` exists
+   separately for the importer and harnesses.
+3. **A legacy-layout guard was added.** The format version lives *inside* a database,
+   so it cannot catch a v1 world: the v2 database is a different directory and simply
+   looks absent, which the blank-start guard would then misreport as a fresh world.
+   The guard names the re-import command instead.
+4. **`DimensionKey.root()` normalises `.` segments.** `getAbsolutePath()` leaves them
+   in, so a server launched with `./world` logged `/srv/./world/rocksmc.db`, which an
+   operator comparing paths reads as a different location.
+
+### Fixed in passing
+
+- `DimensionRegistry` held its lock across a blocking `db.flush(...)`, so one
+  dimension being seen for the first time would have blocked every other dimension's
+  chunk loads once the registry became shared. Now a single synced `WriteBatch`,
+  which is also atomic between the assignment and the counter advance.
+- The same code leaked a `FlushOptions` per newly seen dimension.
+- `WorldImporter` claimed to force `verify-on-read` off but the line was a no-op
+  self-assignment; there is now a real `RocksMcConfig.withVerifyOnRead(false)`.
+
+### Methodological note worth keeping
+
+The crash test nearly produced a false "data lost" conclusion. Three in-game probes
+were unreliable: `execute if block ... run say` returns an empty RCON reply even on
+a hit, `data get block` only works on block entities, and a `clone` destination above
+the build height matches nothing regardless of the source. Two of them reported total
+loss that had not happened. The verdict rests on decoding stored chunk NBT directly
+from the database. **Validate the probe in both directions before trusting a
+measurement** — the same failure that produced the retracted write-amplification
+claims.
 
 ---
 
@@ -148,10 +93,28 @@ world is backed up:
 
 **Status:** identified, not scoped
 
-Consolidation gives a shared WAL. Genuine atomicity between a chunk write and its
-POI write needs both in one `WriteBatch`, which means intercepting above
-`StorageIoWorker` rather than at the current `RegionBasedStorage` seam. That is a
-larger design change than Phase 2 and should follow beta telemetry, not precede it.
+Consolidation gave a shared WAL and therefore a shared recovery point. It did **not**
+make a chunk write atomic with its POI write: RocksDB guarantees atomicity per
+`WriteBatch`, and those two writes originate in independent `StorageIoWorker`
+instances that flush on their own schedule, above the four-method seam this mod
+injects at. Batching them means intercepting higher up — a larger design change that
+should follow beta telemetry rather than precede it.
+
+Do not describe the current state as atomic cross-subsystem commits.
+
+---
+
+## Before the beta
+
+- [ ] **Run a live server with villagers** and confirm POI writes appear
+      (`rocksmc_chunk_writes_total{store="poi"}` non-zero). POI has still never been
+      exercised by a live server — only by the importer and the harness. This is the
+      highest untested risk.
+- [ ] Repeat the `kill -9` test on the **target hardware and filesystem** (Optane +
+      btrfs with `chattr +C`). The four cycles here ran on tmpfs, which has entirely
+      different fsync and writeback behaviour.
+- [ ] Rehearse the rollback once: flip to `backend=anvil`, confirm the world loads.
+- [ ] Import the beta world with `verify-on-read=true` for the first week.
 
 ---
 
@@ -160,33 +123,12 @@ larger design change than Phase 2 and should follow beta telemetry, not precede 
 | Phase | Scope | Notes |
 |---|---|---|
 | **3** | `playerdata`, `data/*.dat`, `level.dat` mirror into CFs | Widens blast radius to player inventories. Until done, backups must include these files — they are **not** in RocksDB |
-| **4** | Checkpoint-based recoverable snapshots | `RocksChunkStore.checkpoint()` exists but nothing calls it. Only meaningful once Phase 2 makes checkpoints world-wide |
+| **4** | Checkpoint-based recoverable snapshots | `RocksDatabase.checkpoint()` exists and is tested, but nothing calls it. Now genuinely world-wide, which is what makes it meaningful |
 | **5** | Bidirectional `.mca` ⇄ RocksDB converter | Required for Amulet, Chunker, BlueMap/Dynmap and pregenerators. Likely more code than the storage layer it replaces |
 
 ---
 
 ## Open items carried from review
-
-### `DimensionRegistry` locking
-
-Reviewed and left as-is. The premise that the map is immutable at runtime does not
-hold: `ordinalFor()` writes to it at `DimensionRegistry.java:136` on the
-lazy-assignment path. The lock guards a check → allocate → persist → cache sequence
-that must be atomic, because `allocateOrdinal()` does a read-modify-write on the
-`\0next` counter; two threads missing the cache could otherwise be handed the same
-ordinal, putting two dimensions in one keyspace.
-
-Not converted to a read-write lock: `ordinalFor()` needs exclusive access anyway,
-`size()`/`snapshot()` have **no production callers** (test-only), and an RWLock is
-slower than `synchronized` when uncontended. Contention was checked and does not
-exist — the metrics path (`RocksChunkStore.snapshot()`) reads only final fields,
-atomics and RocksDB properties, and never touches the registry.
-
-**Real defect worth fixing at Phase 2:** the lock is held across a blocking
-`db.flush(...)`. Harmless today (startup, single-threaded), but once a shared
-registry can assign an ordinal during play, one dimension's flush would block every
-other dimension's chunk load. Also `FlushOptions` is never closed there — a small
-native leak per newly seen dimension.
 
 ### `min-blob-size` is an unresolved trade
 
@@ -198,13 +140,18 @@ because compaction bytes are compaction CPU competing with the tick loop.
 
 ### Untested areas, highest first
 
-1. **POI has never run under a live server.** The dev run logged
-   `poi.rocksdb: writes=0`. POI flows through `SerializingRegionBasedStorage`,
-   which splits chunks into 16 sections above the seam — exercised only by the
-   harness. Verify villagers keep professions and beds across a restart.
-2. **Crash recovery is unverified.** The WAL is checksummed and replayable in
-   principle; no `kill -9` test has been run. Phase 2 makes this mandatory.
+1. **POI has never run under a live server.** The dev runs logged
+   `poi: writes=0` — no villagers in the test world's loaded area. POI flows through
+   `SerializingRegionBasedStorage`, which splits chunks into 16 sections above the
+   seam; the importer wrote 3,754 POI entries successfully and the harness round-trips
+   them, but neither exercises the live section-split path. Verify villagers keep
+   professions and beds across a restart.
+2. **Crash recovery on real storage.** Verified four times, but on tmpfs. btrfs CoW
+   and Optane behave differently enough that the test is worth repeating on target.
 3. **Vanilla Anvil has never been instrumented.** Every comparison against it is
    derived (payload + 8 KiB header per write), which is how the withdrawn "0.32×
    vanilla writes" claim went wrong. Any future "X× better than vanilla" needs the
    same `/proc/self/io` treatment used in Phase 1c.
+4. **Multi-world servers are untested.** The code keys databases on the canonical
+   world root and the tests cover two worlds in one JVM, but no multiverse-style mod
+   has been tried.

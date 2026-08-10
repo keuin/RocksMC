@@ -222,14 +222,20 @@ Write amplification nevertheless matters, just not for throughput. See §5.7.
 
 ### 5.2 What genuinely improves
 
-- **A single recovery point across dimensions.** Vanilla's
-  `MinecraftServer.save()` iterates worlds sequentially, so one database per
-  dimension means one write-ahead log per dimension, and a crash mid-autosave
-  recovers each to a different point in that sequence. Since Minecraft has a single
+- **A single recovery point across dimensions.** ✅ **Delivered (Phase 2).**
+  Vanilla's `MinecraftServer.save()` iterates worlds sequentially, so one database
+  per dimension meant one write-ahead log per dimension, and a crash mid-autosave
+  recovered each to a different point in that sequence. Since Minecraft has a single
   tick loop for all dimensions, that is a state no tick ever produced — it can
   duplicate or destroy an entity caught mid-teleport. One database per world
   eliminates the failure class outright, and there is no filesystem-level substitute
-  for it. See `known-limitations.md` L2; delivered by Phase 2.
+  for it.
+
+  Measured, not merely argued: four `kill -9` cycles mid-autosave on the real
+  293,207-chunk world, the tightest 20 ms after `save-all` so the process died
+  inside the sequential save loop. Every dimension recovered to the same point every
+  time, and a full key scan afterwards found all 293,207 entries with per-dimension
+  counts matching the source `.mca` files exactly. See `known-limitations.md` L2.
 - **Atomic cross-subsystem commits.** Today chunk and POI data live in separate
   `StorageIoWorker` instances over separate directories
   (`VersionedChunkStorage.java:26` vs `SerializingRegionBasedStorage.java:50`), so

@@ -5,8 +5,10 @@ import org.junit.jupiter.api.Test;
 import java.io.File;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Tests for dimension identity derivation.
@@ -224,7 +226,140 @@ class DimensionKeyTest {
 
     @Test
     void equalityAndHashing() {
-        assertEquals(parse("/a/world/region"), parse("/b/world/region"));
-        assertEquals(parse("/a/world/region").hashCode(), parse("/b/world/region").hashCode());
+        assertEquals(parse("/a/world/region"), parse("/a/world/region"));
+        assertEquals(parse("/a/world/region").hashCode(), parse("/a/world/region").hashCode());
+    }
+
+    /**
+     * Two worlds' overworlds share an identity and a leaf but address different
+     * databases, so they must not compare equal. Before {@link DimensionKey#root()}
+     * existed they did, which would let a caller keying on this conflate two worlds.
+     */
+    @Test
+    void keysUnderDifferentRootsAreNotEqual() {
+        assertNotEquals(parse("/a/world/region"), parse("/b/world/region"));
+    }
+
+    // ------------------------------------------------------------------- root
+
+    /**
+     * The world root is what groups a world's six storage directories onto one
+     * database, so every layout must yield it. The number of segments to climb
+     * differs per layout, which is why it comes from the regex rather than from
+     * counting {@code getParentFile()} calls.
+     */
+    @Test
+    void rootOfOverworld() {
+        assertEquals(new File("/srv/world"), parse("/srv/world/region").root());
+        assertEquals(new File("/srv/world"), parse("/srv/world/poi").root());
+    }
+
+    @Test
+    void rootOfVanillaNetherAndEnd() {
+        assertEquals(new File("/srv/world"), parse("/srv/world/DIM-1/region").root());
+        assertEquals(new File("/srv/world"), parse("/srv/world/DIM-1/poi").root());
+        assertEquals(new File("/srv/world"), parse("/srv/world/DIM1/region").root());
+        assertEquals(new File("/srv/world"), parse("/srv/world/DIM1/poi").root());
+    }
+
+    @Test
+    void rootOfCustomDimension() {
+        assertEquals(new File("/srv/world"),
+            parse("/srv/world/dimensions/twilightforest/twilight_forest/region").root());
+        assertEquals(new File("/srv/world"),
+            parse("/srv/world/dimensions/aether/the_aether/poi").root());
+    }
+
+    /** A nested custom path must not be mistaken for part of the root. */
+    @Test
+    void rootOfCustomDimensionWithNestedPath() {
+        assertEquals(new File("/srv/world"),
+            parse("/srv/world/dimensions/mypack/deep/nested/dim/region").root());
+    }
+
+    /**
+     * The property Phase 2 depends on: every storage directory of one world agrees
+     * on the root, and that is what makes them share a database.
+     */
+    @Test
+    void everyStorageDirectoryOfAWorldSharesOneRoot() {
+        String[] dirs = {
+            "/srv/world/region",
+            "/srv/world/poi",
+            "/srv/world/DIM-1/region",
+            "/srv/world/DIM-1/poi",
+            "/srv/world/DIM1/region",
+            "/srv/world/DIM1/poi",
+            "/srv/world/dimensions/twilightforest/twilight_forest/region",
+            "/srv/world/dimensions/twilightforest/twilight_forest/poi",
+        };
+        File expected = new File("/srv/world");
+        for (String dir : dirs) {
+            assertEquals(expected, parse(dir).root(), dir);
+        }
+    }
+
+    /** Distinct worlds must not collapse onto one root, or onto one database. */
+    @Test
+    void distinctWorldsHaveDistinctRoots() {
+        assertNotEquals(parse("/srv/world-a/region").root(),
+            parse("/srv/world-b/region").root());
+        // A world nested inside another world's directory is still its own root.
+        assertNotEquals(parse("/srv/world/region").root(),
+            parse("/srv/world/nested/region").root());
+    }
+
+    /**
+     * Backslash-separated paths yield a root with the dimension part stripped.
+     *
+     * <p>Asserted as a suffix rather than an equality because {@code
+     * fromStorageDirectory} resolves through {@code getAbsolutePath()}: on a Linux
+     * JVM a {@code C:\...} literal is not absolute, so the working directory gets
+     * prepended. That is an artefact of running a Windows path on Linux, not of the
+     * parsing. The property under test is that {@code \DIM-1\region} is removed and
+     * nothing else is.
+     */
+    @Test
+    void rootWithWindowsSeparators() {
+        DimensionKey key = DimensionKey.fromStorageDirectory(
+            new File("C:\\srv\\world\\DIM-1\\region"));
+        assertEquals(DimensionKey.THE_NETHER, key.identity());
+        assertTrue(key.root().getPath().endsWith("C:\\srv\\world"),
+            "expected a root ending in C:\\srv\\world, got " + key.root());
+        assertFalse(key.root().getPath().contains("DIM-1"),
+            "the dimension segment must not remain in the root: " + key.root());
+    }
+
+    @Test
+    void rootToleratesTrailingSeparator() {
+        assertEquals(new File("/srv/world"), parse("/srv/world/region/").root());
+    }
+
+    /**
+     * A launch path like {@code ./world} must not leak a {@code .} segment into the
+     * root, because that root appears in log lines and error messages and would look
+     * like a different path to an operator comparing them.
+     */
+    @Test
+    void rootDropsRedundantDotSegments() {
+        assertFalse(parse("./world/region").root().getPath().contains("/./"),
+            "a '.' segment leaked into the root: " + parse("./world/region").root());
+        assertEquals(new File(System.getProperty("user.dir"), "world"),
+            parse("./world/region").root());
+        assertEquals(new File(System.getProperty("user.dir"), "world"),
+            parse("./world/DIM-1/region").root());
+    }
+
+    /**
+     * A storage directory directly at the filesystem root leaves the regex's root
+     * group empty. Mapping that to {@code /} keeps the result absolute; a bare
+     * {@code File("")} would resolve against the working directory instead, so a
+     * database would be created somewhere unrelated.
+     */
+    @Test
+    void rootAtFilesystemRootStaysAbsolute() {
+        File root = parse("/region").root();
+        assertEquals(new File("/"), root);
+        assertTrue(root.isAbsolute(), "root must stay absolute, got " + root);
     }
 }

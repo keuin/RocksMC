@@ -24,7 +24,7 @@ public final class RocksMcConfig {
     public enum Backend {
         /** Vanilla Anvil region files. The default. */
         ANVIL,
-        /** RocksDB, one database per world directory. */
+        /** RocksDB, one database per world. */
         ROCKSDB
     }
 
@@ -75,6 +75,21 @@ public final class RocksMcConfig {
         return of(new Properties());
     }
 
+    /**
+     * A copy with {@code verify-on-read} forced to a given value.
+     *
+     * <p>For the importer, which runs its own full verification pass and would
+     * otherwise do the work twice. A real copy rather than a mutable field because
+     * one configuration object is shared by every store of a world.
+     */
+    public RocksMcConfig withVerifyOnRead(boolean value) {
+        return new RocksMcConfig(this.backend, this.minBlobSize, this.syncWrites,
+            value, this.allowBlankStart, this.maxBackgroundJobs, this.maxSubcompactions,
+            this.writeBufferSize, this.maxWriteBufferNumber, this.bytesPerSync,
+            this.blockCacheSize, this.level0SlowdownTrigger, this.metricsEnabled,
+            this.metricsBind, this.metricsPort, this.statsLogIntervalSeconds);
+    }
+
     public static RocksMcConfig of(Properties props) {
         Backend backend;
         try {
@@ -91,10 +106,10 @@ public final class RocksMcConfig {
             parseBool(props, "allow-blank-start", false),
             parseInt(props, "max-background-jobs", 8),
             parseInt(props, "max-subcompactions", 4),
-            parseLong(props, "write-buffer-size", 64L * 1024 * 1024),
+            parseLong(props, "write-buffer-size", 128L * 1024 * 1024),
             parseInt(props, "max-write-buffer-number", 4),
             parseLong(props, "bytes-per-sync", 1024L * 1024),
-            parseLong(props, "block-cache-size", 256L * 1024 * 1024),
+            parseLong(props, "block-cache-size", 512L * 1024 * 1024),
             parseInt(props, "level0-slowdown-writes-trigger", 20),
             parseBool(props, "metrics-enabled", false),
             props.getProperty("metrics-bind", "127.0.0.1").trim(),
@@ -193,6 +208,9 @@ public final class RocksMcConfig {
      * <p>RocksDB defaults to 2, sized for spinning disks. Compaction bytes are
      * compaction CPU, and unfinished compaction eventually stalls writes on the IO
      * worker, so on fast storage it is better to drain it aggressively.
+     *
+     * <p>One pool for the world. Before consolidation this was allocated per store,
+     * so a three-dimension world really got six times this number of threads.
      */
     public int maxBackgroundJobs() {
         return this.maxBackgroundJobs;
@@ -204,12 +222,17 @@ public final class RocksMcConfig {
     }
 
     /**
-     * Memtable size.
+     * Memtable size, per column family.
      *
      * <p>The dominant write pattern is the same hot chunks being saved repeatedly,
      * and {@code StorageIoWorker} already coalesces within one autosave. A larger
      * memtable extends that coalescing across autosaves, so fewer versions of a
      * chunk ever reach disk.
+     *
+     * <p>Applies to the {@code chunk} and {@code poi} column families, so worst-case
+     * memtable memory is this times {@link #maxWriteBufferNumber()} times two --
+     * not times six as it was when every store had its own database. All dimensions
+     * share a column family, which is also why the default could be raised.
      */
     public long writeBufferSize() {
         return this.writeBufferSize;
@@ -233,6 +256,11 @@ public final class RocksMcConfig {
 
     /**
      * Block cache size, shared by index, filter and data blocks.
+     *
+     * <p>One cache for the whole world. Before consolidation each store allocated
+     * its own, so this figure silently multiplied by six -- a 512 MiB setting really
+     * meant 3 GiB. It now means what it says, which is why the default could be
+     * raised to 512 MiB without increasing real usage.
      *
      * <p>Note this does not cache chunk values: those live in blob files, which
      * RocksDB 10.x does not offer a per-column-family blob cache for. Chunk reads
