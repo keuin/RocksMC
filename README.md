@@ -267,8 +267,9 @@ and a strict parity mode is retained.
       importer, Prometheus exporter, periodic stats, perf knobs
 - [x] **Phase 2** — **one database per world** (chunk + POI column families);
       a single recovery point across all dimensions
+- [x] **Phase 4** — checkpoint-based recoverable snapshots, manual and scheduled,
+      with retention; restore verified to recover all 293,207 entries
 - [ ] **Phase 3** — `playerdata` + `state`
-- [ ] **Phase 4** — checkpoint-based recoverable snapshots
 - [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
 
 **Beta-capable, not production-ready.** See
@@ -334,6 +335,7 @@ re-import command. The old directories are left untouched, so older builds and
 | `/rocksmc flush` | Flush memtables to SST files |
 | `/rocksmc compact` | Compact the whole keyspace and collect obsolete blobs |
 | `/rocksmc checkpoint [name]` | Consistent snapshot under `<world>/rocksmc-checkpoints/` |
+| `/rocksmc checkpoints` | List them, marking which retention may delete |
 
 All require permission level 4. `flush`, `compact` and `checkpoint` run on a
 background thread and report to the server log when they finish, because a compaction
@@ -341,7 +343,11 @@ of a real 1.1 GB database is not instant and running it on the server thread wou
 stall every player. Only one runs at a time; a second request is refused rather than
 queued.
 
-⚠️ A checkpoint is hard-link based — measured at **0 ms on a real 1.1 GB database** —
+Checkpoints can also run on a timer: set `checkpoint-interval-minutes` and
+`checkpoint-keep`. Retention only deletes automatic (`auto-`) names, never one you
+named by hand.
+
+⚠️ A checkpoint is hard-link based — measured at **4 ms on a real 1.1 GB database** —
 so it costs almost nothing and needs no pause, which is the capability Anvil
 structurally cannot offer. But the links share blocks with the live database, so it
 protects against logical corruption and bad deploys, **not** against losing the drive.

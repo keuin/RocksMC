@@ -161,6 +161,33 @@ public final class MetricsExporter implements AutoCloseable {
             out.add(counter("rocksmc_scrapes_total", "Metrics scrapes served",
                 this.scrapes.get()));
 
+            // ---- checkpoints ----
+            // Exporter-level rather than per-database: checkpointing is a mod-wide
+            // activity on one shared timer, and a per-database split would imply an
+            // independence that does not exist.
+            out.add(counter("rocksmc_checkpoints_total",
+                "Checkpoints created, automatic and manual",
+                CheckpointScheduler.checkpointCount()));
+            out.add(counter("rocksmc_checkpoint_failures_total",
+                "Checkpoint attempts that failed",
+                CheckpointScheduler.failureCount()));
+            out.add(counter("rocksmc_checkpoints_pruned_total",
+                "Old automatic checkpoints deleted by retention",
+                CheckpointScheduler.prunedCount()));
+            // A timestamp rather than an age, so a scraper computes staleness itself
+            // and the value does not change between scrapes for a static system. 0
+            // means none has been taken, which is why it is emitted rather than
+            // omitted -- absence would look like a scrape problem.
+            out.add(gauge("rocksmc_checkpoint_last_success_timestamp_seconds",
+                "Unix time of the last successful checkpoint, 0 if none",
+                CheckpointScheduler.lastSuccessEpochSeconds()));
+            long lastDuration = CheckpointScheduler.lastDurationMillis();
+            if (lastDuration >= 0) {
+                out.add(gauge("rocksmc_checkpoint_last_duration_seconds",
+                    "Duration of the most recent checkpoint",
+                    lastDuration / 1000.0));
+            }
+
             // ---- per-store counters ----
             // These are the mod's own AtomicLongs, so they remain honestly
             // attributable to one dimension and one leaf.

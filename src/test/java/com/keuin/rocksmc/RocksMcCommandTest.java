@@ -11,7 +11,6 @@ import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -80,7 +79,8 @@ class RocksMcCommandTest {
         assertTrue(subcommands.contains("flush"));
         assertTrue(subcommands.contains("compact"));
         assertTrue(subcommands.contains("checkpoint"));
-        assertEquals(5, subcommands.size(), "update the docs if this changes");
+        assertTrue(subcommands.contains("checkpoints"));
+        assertEquals(6, subcommands.size(), "update the docs if this changes");
     }
 
     // --------------------------------------------------------------- formatting
@@ -111,42 +111,6 @@ class RocksMcCommandTest {
     @Test
     void unavailableValuesRenderAsNotApplicable() {
         assertEquals("n/a", RocksMcCommand.bytes(-1));
-    }
-
-    // --------------------------------------------------------------- timestamps
-
-    /**
-     * Checkpoint names must sort chronologically as plain strings.
-     *
-     * <p>Retention prunes the oldest by name, so a format that does not sort would
-     * delete the wrong one. UTC for the same reason: a local-time name repeats during
-     * a DST fallback, which would make two checkpoints collide once a year.
-     */
-    @Test
-    void checkpointTimestampsAreSortableAndFilesystemSafe() {
-        String stamp = RocksMcCommand.timestamp();
-        assertTrue(stamp.matches("\\d{8}-\\d{6}"),
-            "expected yyyyMMdd-HHmmss, got " + stamp);
-        // No characters that need quoting or that Windows rejects in a filename.
-        assertFalse(stamp.matches(".*[:/\\\\ ].*"), stamp);
-    }
-
-    @Test
-    void checkpointTimestampsSortLexicographically() throws Exception {
-        // Two stamps a second apart must order correctly as strings.
-        String first = RocksMcCommand.timestamp();
-        Thread.sleep(1100);
-        String second = RocksMcCommand.timestamp();
-        assertNotEquals(first, second);
-        assertTrue(first.compareTo(second) < 0,
-            "timestamps must sort chronologically: " + first + " vs " + second);
-    }
-
-    @Test
-    void checkpointDirectoryNameIsStable() {
-        // Referenced by docs and by the retention logic, so a rename is a breaking
-        // change rather than a detail.
-        assertEquals("rocksmc-checkpoints", RocksMcCommand.CHECKPOINT_DIR_NAME);
     }
 
     private static net.minecraft.nbt.NbtCompound tag(String marker) {

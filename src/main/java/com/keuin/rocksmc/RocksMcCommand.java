@@ -10,13 +10,10 @@ import net.minecraft.text.Text;
 
 import java.io.File;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.TimeZone;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -55,12 +52,6 @@ import java.util.concurrent.Executors;
  * the highest level), because they all either expose world size or consume real IO.
  */
 public final class RocksMcCommand {
-
-    /** Timestamped checkpoint directory names, sortable and filesystem-safe. */
-    private static final String CHECKPOINT_TIME_FORMAT = "yyyyMMdd-HHmmss";
-
-    /** Where checkpoints go, relative to the world root. */
-    static final String CHECKPOINT_DIR_NAME = "rocksmc-checkpoints";
 
     /**
      * Runs the blocking subcommands. Created lazily so a server that never uses
@@ -110,7 +101,50 @@ public final class RocksMcCommand {
                         database -> checkpoint(database, name));
                 })));
 
+        root.then(CommandManager.literal("checkpoints")
+            .executes(context -> listCheckpoints(context.getSource())));
+
         dispatcher.register(root);
+    }
+
+    /**
+     * Lists existing checkpoints, marking which are automatic.
+     *
+     * <p>The companion to taking them: without this an operator has to go to the
+     * filesystem to find out what they can roll back to, and cannot tell which are
+     * subject to retention.
+     */
+    private static int listCheckpoints(ServerCommandSource source) {
+        List<RocksDatabase> databases = StoreRegistry.databases();
+        if (databases.isEmpty()) {
+            source.sendError(text("rocksmc: no database open."));
+            return 0;
+        }
+        for (RocksDatabase database : databases) {
+            List<File> checkpoints = CheckpointScheduler.list(database);
+            if (checkpoints.isEmpty()) {
+                source.sendFeedback(text(database.name()
+                    + ": no checkpoints. Take one with /rocksmc checkpoint"), false);
+                continue;
+            }
+            source.sendFeedback(text(database.name() + ": " + checkpoints.size()
+                + " checkpoint(s), oldest first"), false);
+            for (File checkpoint : checkpoints) {
+                boolean automatic = checkpoint.getName()
+                    .startsWith(CheckpointScheduler.AUTOMATIC_PREFIX);
+                source.sendFeedback(text(String.format(Locale.ROOT, "  %-28s %8s %s",
+                    checkpoint.getName(),
+                    CheckpointScheduler.formatBytes(
+                        CheckpointScheduler.directoryBytes(checkpoint)),
+                    automatic ? "(automatic, subject to retention)" : "(manual, kept)")),
+                    false);
+            }
+            // Stated every time, because "instant backup" is the wrong mental model and
+            // a dangerous one to act on.
+            source.sendFeedback(text("  hard-linked: protects against corruption and "
+                + "bad deploys, NOT against losing the drive"), false);
+        }
+        return 1;
     }
 
     // ------------------------------------------------------------------ inline
@@ -285,29 +319,15 @@ public final class RocksMcCommand {
      */
     private static String checkpoint(RocksDatabase database, String name)
             throws IOException {
-        File dir = new File(database.worldRoot(), CHECKPOINT_DIR_NAME);
-        String label = name != null ? name : timestamp();
-        File target = new File(dir, label);
-        if (target.exists()) {
-            throw new IOException("checkpoint already exists: " + target
-                + " (pick another name, or delete it)");
-        }
-        if (!dir.isDirectory() && !dir.mkdirs()) {
-            throw new IOException("could not create " + dir);
-        }
-        // RocksDB requires the target itself not to exist; it creates it.
-        database.checkpoint(target);
-        return "checkpoint at " + target + " (" + bytes(directoryBytes(target))
+        File target = CheckpointScheduler.create(database, name);
+        // Manual checkpoints are never pruned, so retention is not applied here --
+        // see CheckpointScheduler.prune. An operator naming one by hand means to keep
+        // it, and losing a deliberate 'before-upgrade' to the timer would be exactly
+        // the wrong failure.
+        return "checkpoint at " + target + " ("
+            + CheckpointScheduler.formatBytes(CheckpointScheduler.directoryBytes(target))
             + ", hard-linked so it shares blocks with the live database -- "
             + "not an off-device backup)";
-    }
-
-    static String timestamp() {
-        SimpleDateFormat format = new SimpleDateFormat(CHECKPOINT_TIME_FORMAT, Locale.ROOT);
-        // UTC so checkpoint names sort chronologically regardless of host timezone
-        // and do not repeat across a DST transition.
-        format.setTimeZone(TimeZone.getTimeZone("UTC"));
-        return format.format(new Date());
     }
 
     // ------------------------------------------------------------------ output
@@ -325,34 +345,9 @@ public final class RocksMcCommand {
         return total;
     }
 
-    private static long directoryBytes(File dir) {
-        File[] files = dir.listFiles();
-        if (files == null) {
-            return 0L;
-        }
-        long total = 0L;
-        for (File f : files) {
-            total += f.isDirectory() ? directoryBytes(f) : f.length();
-        }
-        return total;
-    }
-
     /** Human-readable bytes; a raw count of blob bytes is unreadable in chat. */
     static String bytes(long value) {
-        if (value < 0) {
-            return "n/a";
-        }
-        if (value < 1024) {
-            return value + " B";
-        }
-        String[] units = {"KiB", "MiB", "GiB", "TiB"};
-        double scaled = value / 1024.0;
-        int unit = 0;
-        while (scaled >= 1024 && unit < units.length - 1) {
-            scaled /= 1024.0;
-            unit++;
-        }
-        return String.format(Locale.ROOT, "%.1f %s", scaled, units[unit]);
+        return CheckpointScheduler.formatBytes(value);
     }
 
     /** Visible for tests: the subcommands a build offers. */
@@ -363,6 +358,7 @@ public final class RocksMcCommand {
         out.add("flush");
         out.add("compact");
         out.add("checkpoint");
+        out.add("checkpoints");
         return out;
     }
 

@@ -74,6 +74,7 @@ public final class RocksMc implements DedicatedServerModInitializer {
             metrics = MetricsExporter.start(config.metricsBind(), config.metricsPort());
         }
         startStatsLogger();
+        CheckpointScheduler.start(config);
         Runtime.getRuntime().addShutdownHook(new Thread(RocksMc::shutdown, "rocksmc-shutdown"));
     }
 
@@ -151,6 +152,9 @@ public final class RocksMc implements DedicatedServerModInitializer {
     }
 
     private static void shutdown() {
+        // Before the exporter, so a checkpoint in flight is not abandoned mid-write by
+        // a JVM that has already torn down its telemetry.
+        CheckpointScheduler.stop();
         if (statsLogger != null) {
             statsLogger.shutdownNow();
         }

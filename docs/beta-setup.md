@@ -200,6 +200,7 @@ Available in-game or from the console, all at permission level 4:
 /rocksmc flush                  flush memtables to SST files
 /rocksmc compact                compact the keyspace, collect obsolete blobs
 /rocksmc checkpoint [name]      consistent snapshot, near-instant
+/rocksmc checkpoints            list them, marking which retention may delete
 ```
 
 `flush`, `compact` and `checkpoint` run in the background and report to the server
@@ -216,9 +217,20 @@ them in a wall of numbers.
 /rocksmc checkpoint before-upgrade
 ```
 
-Creates `<world>/rocksmc-checkpoints/before-upgrade`, or a UTC timestamp if no name
-is given. Measured at **0 ms on a real 1.1 GB database**, because it only creates hard
-links — so taking one before any risky operation costs nothing.
+Creates `<world>/rocksmc-checkpoints/before-upgrade`, or `auto-<UTC timestamp>` if no
+name is given. Measured at **4 ms on a real 1.1 GB database**, because it only creates
+hard links — so taking one before any risky operation costs nothing.
+
+Automatic checkpoints can also run on a timer:
+
+```properties
+checkpoint-interval-minutes=60
+checkpoint-keep=6
+```
+
+Retention only ever deletes names beginning `auto-`, so a checkpoint you named by
+hand is **never** pruned. That is deliberate: naming one means you expect to need
+it.
 
 To restore: stop the server, move the live `rocksmc.db` aside, and copy the checkpoint
 into its place.

@@ -326,6 +326,37 @@ class MetricsExporterTest {
         }
     }
 
+    /**
+     * Checkpoint telemetry must be present even before any checkpoint exists.
+     *
+     * <p>The last-success timestamp is emitted as 0 rather than omitted: an absent
+     * series looks like a scrape problem, whereas 0 is unambiguously "none yet" and
+     * lets an alert on staleness work from the first scrape.
+     */
+    @Test
+    void checkpointMetricsAreExposed(@TempDir Path tmp) throws Exception {
+        CheckpointScheduler.resetCountersForTesting();
+        try (RocksChunkStore store = open(tmp, "region")) {
+            String before = render();
+            assertTrue(before.contains("rocksmc_checkpoints_total"), before);
+            assertTrue(before.contains("rocksmc_checkpoint_failures_total"), before);
+            assertTrue(before.contains("rocksmc_checkpoints_pruned_total"), before);
+            assertTrue(before.contains("rocksmc_checkpoint_last_success_timestamp_seconds 0"),
+                "with no checkpoint yet the timestamp must be 0, not absent:\n" + before);
+
+            CheckpointScheduler.create(store.database(), "metrics-test");
+
+            String after = render();
+            assertTrue(after.contains("rocksmc_checkpoints_total 1.0")
+                    || after.contains("rocksmc_checkpoints_total 1"),
+                "the counter must advance:\n" + after);
+            assertFalse(after.contains("rocksmc_checkpoint_last_success_timestamp_seconds 0"),
+                "the timestamp must be set after a checkpoint:\n" + after);
+            assertTrue(after.contains("rocksmc_checkpoint_last_duration_seconds"),
+                "duration appears once a checkpoint has been taken:\n" + after);
+        }
+    }
+
     private static NbtCompound tag() {
         NbtCompound nbt = new NbtCompound();
         nbt.putString("marker", "x");
