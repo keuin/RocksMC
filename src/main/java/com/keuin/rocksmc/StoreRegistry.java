@@ -42,10 +42,6 @@ public final class StoreRegistry {
         return new ArrayList<>(STORES);
     }
 
-    public static int size() {
-        return STORES.size();
-    }
-
     /**
      * Registered by {@link RocksDatabase#open} on first open, not once per store.
      *

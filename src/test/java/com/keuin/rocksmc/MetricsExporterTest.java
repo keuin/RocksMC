@@ -17,6 +17,7 @@ import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -277,6 +278,52 @@ class MetricsExporterTest {
 
         poi.close();
         assertTrue(render().contains("rocksmc_databases 0"));
+    }
+
+    /**
+     * Two worlds whose directories share a name must not break the scrape.
+     *
+     * <p>The {@code database} label was the world directory's short name, so
+     * {@code /srv/a/world} and {@code /srv/b/world} produced two datapoints carrying
+     * identical labels. The Prometheus client rejects that with
+     * {@code DuplicateLabelsException}, which fails the <em>entire</em>
+     * {@code /metrics} response rather than one series -- so monitoring went dark
+     * precisely on the multi-world setups most likely to need it.
+     */
+    @Test
+    void sameNamedWorldsDoNotBreakTheScrape(@TempDir Path tmp) throws Exception {
+        File a = new File(tmp.toFile(), "a/world");
+        File b = new File(tmp.toFile(), "b/world");
+        assertTrue(a.mkdirs());
+        assertTrue(b.mkdirs());
+
+        try (RocksChunkStore first = open(a.toPath(), "region");
+             RocksChunkStore second = open(b.toPath(), "region")) {
+            assertTrue(first.database() != second.database(),
+                "two worlds must be two databases");
+
+            // This is the call that used to throw DuplicateLabelsException.
+            String out = render();
+            assertTrue(out.contains("rocksmc_databases 2"), out);
+            assertEquals(2, countSeries(out, "rocksmc_blob_file_bytes"),
+                "each database needs its own series:\n" + out);
+
+            List<String> lines = seriesLines(out, "rocksmc_blob_file_bytes");
+            assertEquals(2, lines.size());
+            assertNotEquals(lines.get(0), lines.get(1),
+                "the database label must distinguish the two worlds: " + lines);
+        }
+    }
+
+    /** The label must identify the world unambiguously, not just its directory name. */
+    @Test
+    void databaseLabelIsTheFullWorldPath(@TempDir Path tmp) throws Exception {
+        try (RocksChunkStore store = open(tmp, "region")) {
+            String expected = tmp.toFile().getCanonicalPath();
+            assertEquals(expected, store.database().name());
+            assertTrue(render().contains("database=\"" + expected + "\""),
+                "the exposition must carry the full path, got:\n" + render());
+        }
     }
 
     private static NbtCompound tag() {

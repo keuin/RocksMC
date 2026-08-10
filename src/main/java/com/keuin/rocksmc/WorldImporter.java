@@ -229,22 +229,14 @@ public final class WorldImporter {
      * directory still gets its own {@link RocksChunkStore} view, because that is
      * what carries the dimension ordinal and the column family.
      *
+     * <p>{@code threads = 1} runs everything on the calling thread with no executor
+     * at all, which keeps the sequential path available for diagnosing whether a
+     * problem is concurrency-related; {@link #defaultThreads()} is the usual value.
+     *
      * @param worldDir  the world root, containing {@code region/}
      * @param overwrite import into a database that already holds data
      * @param progress  optional callback; may be {@code null}
-     */
-    public static Result importWorld(File worldDir, RocksMcConfig config, boolean overwrite,
-            Progress progress) throws IOException {
-        return importWorld(worldDir, config, overwrite, progress, defaultThreads());
-    }
-
-    /**
-     * As {@link #importWorld(File, RocksMcConfig, boolean, Progress)}, with an
-     * explicit worker count.
-     *
-     * <p>{@code threads = 1} runs everything on the calling thread with no executor
-     * at all, which keeps the sequential path available for diagnosing whether a
-     * problem is concurrency-related.
+     * @param threads   parallel region workers, at least 1
      */
     public static Result importWorld(File worldDir, RocksMcConfig config, boolean overwrite,
             Progress progress, int threads) throws IOException {

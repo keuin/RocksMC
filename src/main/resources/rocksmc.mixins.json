@@ -3,6 +3,7 @@
 	"package": "com.keuin.rocksmc.mixin",
 	"compatibilityLevel": "JAVA_8",
 	"server": [
+		"CommandManagerMixin",
 		"RegionBasedStorageMixin"
 	],
 	"injectors": {

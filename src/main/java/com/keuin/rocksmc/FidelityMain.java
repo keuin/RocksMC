@@ -102,6 +102,8 @@ public final class FidelityMain {
                 total.anvilOnDisk += stats.anvilOnDisk;
                 total.uncompressedBytes += stats.uncompressedBytes;
                 total.rocksOnDisk += stats.rocksOnDisk;
+                total.externalChunks += stats.externalChunks;
+                total.anomalies.merge(stats.anomalies);
             } finally {
                 if (keep) {
                     System.out.println("  scratch db kept at " + scratch);

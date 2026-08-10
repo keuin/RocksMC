@@ -3,21 +3,15 @@ package com.keuin.rocksmc;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtIo;
-import net.minecraft.util.math.ChunkPos;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.InflaterInputStream;
 
 /**
  * Round-trip fidelity harness: Anvil -&gt; RocksDB -&gt; compare.
@@ -40,8 +34,6 @@ import java.util.zip.InflaterInputStream;
  */
 public final class FidelityHarness {
 
-    private static final int SECTOR = 4096;
-
     public static final class Stats {
         public int chunksFound;
         public int chunksVerified;
@@ -57,6 +49,10 @@ public final class FidelityHarness {
         public long anvilOnDisk;
         public long uncompressedBytes;
         public long rocksOnDisk;
+        /** Chunks that lived in an external .mcc file. */
+        public int externalChunks;
+        /** Anvil-side anomalies, counted rather than thrown. */
+        public final AnvilReader.Report anomalies = new AnvilReader.Report();
         public final List<String> mismatchDetails = new ArrayList<>();
 
         public double deflateRatio() {
@@ -74,6 +70,16 @@ public final class FidelityHarness {
             StringBuilder sb = new StringBuilder();
             sb.append(String.format("chunks=%d verified=%d mismatches=%d readFailures=%d%n",
                 this.chunksFound, this.chunksVerified, this.mismatches, this.readFailures));
+            if (this.externalChunks > 0) {
+                // Reported because these were silently skipped before the harness
+                // shared AnvilReader's parser, which biased every figure below
+                // against the largest chunks in the world.
+                sb.append(String.format("external (.mcc)    = %,d chunks%n",
+                    this.externalChunks));
+            }
+            if (this.anomalies.total() > 0) {
+                sb.append(String.format("anvil anomalies    = %s%n", this.anomalies));
+            }
             sb.append(String.format("uncompressed NBT   = %,d bytes (mean %,d/chunk)%n",
                 this.uncompressedBytes,
                 this.chunksFound == 0 ? 0 : this.uncompressedBytes / this.chunksFound));
@@ -102,23 +108,6 @@ public final class FidelityHarness {
                 }
             }
             return sb.toString();
-        }
-    }
-
-    /**
-     * One chunk as stored by Anvil, already decompressed.
-     */
-    private static final class RawChunk {
-        final ChunkPos pos;
-        final int compressedLen;
-        final NbtCompound nbt;
-        final int uncompressedLen;
-
-        RawChunk(ChunkPos pos, int compressedLen, NbtCompound nbt, int uncompressedLen) {
-            this.pos = pos;
-            this.compressedLen = compressedLen;
-            this.nbt = nbt;
-            this.uncompressedLen = uncompressedLen;
         }
     }
 
@@ -161,38 +150,37 @@ public final class FidelityHarness {
         // the harness must not leave anything behind in it.
         DimensionKey dimension = source.withRoot(scratchDb);
 
+        // One report for the whole run: Anvil anomalies are counted rather than
+        // thrown, and a nonzero total is reported alongside the fidelity verdict.
+        AnvilReader.Report anomalies = new AnvilReader.Report();
+
         try (RocksChunkStore store = RocksChunkStore.open(dimension, config)) {
-            outer:
             for (File region : regions) {
-                for (RawChunk chunk : readRegion(region)) {
-                    // Break the OUTER loop: continuing would call readRegion() on
-                    // every remaining region file -- fully parsing and inflating
-                    // every chunk in each -- only to discard the results. That made
-                    // the earlier throughput figures meaningless.
-                    if (limit > 0 && stats.chunksFound >= limit) {
-                        break outer;
-                    }
-                    stats.chunksFound++;
-                    stats.compressedBytes += chunk.compressedLen;
-                    stats.uncompressedBytes += chunk.uncompressedLen;
-
-                    store.write(chunk.pos, chunk.nbt);
-                    NbtCompound readBack = store.read(chunk.pos);
-
-                    if (readBack == null) {
-                        stats.readFailures++;
-                        stats.mismatchDetails.add(chunk.pos + ": read returned null");
-                    } else if (!Objects.equals(chunk.nbt, readBack)) /* NBT implements equals */ {
-                        stats.mismatches++;
-                        if (stats.mismatchDetails.size() < 20) {
-                            stats.mismatchDetails.add(
-                                chunk.pos + ": " + firstDifference(chunk.nbt, readBack, "root"));
+                if (limit > 0 && stats.chunksFound >= limit) {
+                    // Stop before opening the next file. Continuing would parse and
+                    // inflate every chunk in every remaining region only to discard
+                    // the results, which is what made earlier throughput figures
+                    // meaningless.
+                    break;
+                }
+                try {
+                    AnvilReader.stream(region, anomalies, entry -> {
+                        if (limit > 0 && stats.chunksFound >= limit) {
+                            return;
                         }
-                    } else {
-                        stats.chunksVerified++;
+                        verifyOne(store, entry, stats);
+                    });
+                } catch (IOException e) {
+                    // Recorded rather than swallowed: a region that cannot be read at
+                    // all is a fidelity result, not a detail to drop.
+                    stats.readFailures++;
+                    if (stats.mismatchDetails.size() < 20) {
+                        stats.mismatchDetails.add(
+                            region.getName() + ": could not read: " + e);
                     }
                 }
             }
+            stats.anomalies.merge(anomalies);
             // Compact before measuring. A WAL sync alone leaves everything in
             // memtables, and flushing alone leaves un-merged L0 files and obsolete
             // blobs on disk, which inflates the footprint and would bias the size
@@ -207,94 +195,50 @@ public final class FidelityHarness {
     }
 
     /**
-     * Parses an Anvil region file directly.
+     * Writes one chunk, reads it back, and records the comparison.
      *
-     * <p>Layout: 4096 bytes of packed sector entries (offset = value &gt;&gt;&gt; 8 in
-     * sectors, size = value &amp; 0xFF), 4096 bytes of timestamps, then payloads
-     * prefixed by a big-endian length and a one-byte compression scheme
-     * (1 = gzip, 2 = zlib, 3 = none; high bit set means an external .mcc file).
+     * <p>Region parsing is delegated to {@link AnvilReader} rather than duplicated
+     * here. It used to be a private parser in this class, which silently skipped
+     * chunks stored in external {@code .mcc} files -- so the harness measured a
+     * different chunk population than the importer, and every published fidelity and
+     * size figure excluded the very largest chunks in the world. Sharing one parser
+     * makes that class of divergence impossible.
+     *
+     * <p>Equality is NBT's own deep {@code equals}, not a byte comparison of
+     * re-serialised output: the latter is stricter than the contract and would fail on
+     * legitimate map-ordering differences.
      */
-    private static List<RawChunk> readRegion(File file) throws IOException {
-        List<RawChunk> out = new ArrayList<>();
-        if (file.length() < SECTOR * 2L) {
-            // Vanilla creates region files on demand and leaves them empty until a
-            // chunk in that region is actually written. Not corruption.
-            return out;
+    private static void verifyOne(RocksChunkStore store, AnvilReader.Entry entry,
+            Stats stats) throws IOException {
+        stats.chunksFound++;
+        stats.compressedBytes += entry.compressedLength();
+        if (entry.external()) {
+            stats.externalChunks++;
         }
 
-        String[] parts = file.getName().split("\\.");
-        int regionX = Integer.parseInt(parts[1]);
-        int regionZ = Integer.parseInt(parts[2]);
+        NbtCompound nbt = entry.nbt();
+        stats.uncompressedBytes += uncompressedSize(nbt);
 
-        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
-            byte[] header = new byte[SECTOR];
-            raf.readFully(header);
-            for (int i = 0; i < 1024; i++) {
-                int packed = ((header[i * 4] & 0xFF) << 24)
-                    | ((header[i * 4 + 1] & 0xFF) << 16)
-                    | ((header[i * 4 + 2] & 0xFF) << 8)
-                    | (header[i * 4 + 3] & 0xFF);
-                if (packed == 0) {
-                    continue;
-                }
-                int offset = packed >>> 8;
-                int sectors = packed & 0xFF;
-                if (offset < 2 || sectors == 0 || (long) offset * SECTOR >= file.length()) {
-                    continue;
-                }
+        store.write(entry.pos(), nbt);
+        NbtCompound readBack = store.read(entry.pos());
 
-                raf.seek((long) offset * SECTOR);
-                int declaredLen = raf.readInt();
-                int scheme = raf.readUnsignedByte();
-                if ((scheme & 0x80) != 0 || declaredLen <= 1) {
-                    continue;
-                }
-                int payloadLen = declaredLen - 1;
-                if (payloadLen > sectors * SECTOR) {
-                    continue;
-                }
-                byte[] payload = new byte[payloadLen];
-                raf.readFully(payload);
-
-                NbtCompound nbt;
-                try {
-                    nbt = decode(payload, scheme & 0x7F);
-                } catch (IOException e) {
-                    continue;
-                }
-                if (nbt == null) {
-                    continue;
-                }
-
-                int chunkX = regionX * 32 + (i % 32);
-                int chunkZ = regionZ * 32 + (i / 32);
-                out.add(new RawChunk(new ChunkPos(chunkX, chunkZ), payloadLen,
-                    nbt, uncompressedSize(nbt)));
+        if (readBack == null) {
+            stats.readFailures++;
+            if (stats.mismatchDetails.size() < 20) {
+                stats.mismatchDetails.add(entry.pos() + ": read returned null");
             }
-        }
-        return out;
-    }
-
-    private static NbtCompound decode(byte[] payload, int scheme) throws IOException {
-        ByteArrayInputStream raw = new ByteArrayInputStream(payload);
-        switch (scheme) {
-            case 1:
-                try (DataInputStream in = new DataInputStream(new GZIPInputStream(raw))) {
-                    return NbtIo.read(in);
-                }
-            case 2:
-                try (DataInputStream in = new DataInputStream(new InflaterInputStream(raw))) {
-                    return NbtIo.read(in);
-                }
-            case 3:
-                try (DataInputStream in = new DataInputStream(raw)) {
-                    return NbtIo.read(in);
-                }
-            default:
-                return null;
+        } else if (!Objects.equals(nbt, readBack)) {
+            stats.mismatches++;
+            if (stats.mismatchDetails.size() < 20) {
+                stats.mismatchDetails.add(
+                    entry.pos() + ": " + firstDifference(nbt, readBack, "root"));
+            }
+        } else {
+            stats.chunksVerified++;
         }
     }
 
+    /** Serialised size of the NBT as this mod stores it: uncompressed. */
     private static int uncompressedSize(NbtCompound nbt) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream(64 * 1024);
         try (DataOutputStream out = new DataOutputStream(buffer)) {

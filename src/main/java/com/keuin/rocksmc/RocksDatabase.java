@@ -238,7 +238,10 @@ public final class RocksDatabase {
             .setMaxWriteBufferNumber(config.maxWriteBufferNumber())
             // Raised from the default 8: fast storage drains L0 quickly, so
             // throttling writes early costs tick time for no benefit.
-            .setLevel0SlowdownWritesTrigger(config.level0SlowdownTrigger());
+            .setLevel0SlowdownWritesTrigger(config.level0SlowdownTrigger())
+            // Must stay at or above the slowdown trigger, which the config enforces:
+            // otherwise writes stall without being throttled gently first.
+            .setLevel0StopWritesTrigger(config.level0StopTrigger());
 
         // The format marker and the dimension registry are a handful of tiny
         // entries. Blob files and heavy compression would be pure overhead.
@@ -253,7 +256,18 @@ public final class RocksDatabase {
             // Trickle writeback out in small increments instead of letting it pile
             // up until file close, which otherwise shows up as a tick stall.
             .setBytesPerSync(config.bytesPerSync())
-            .setWalBytesPerSync(config.bytesPerSync());
+            .setWalBytesPerSync(config.bytesPerSync())
+            // Unlimited by default, matching RocksDB. Settable because a large
+            // world's blob files accumulate and a shared host with a low
+            // RLIMIT_NOFILE otherwise dies days later with "too many open files".
+            .setMaxOpenFiles(config.maxOpenFiles());
+
+        // 0 means "RocksDB's default", so only override when asked. With
+        // sync-writes=false the WAL is the durability mechanism, and bounding it
+        // bounds both recovery time and disk use on a mostly-idle world.
+        if (config.maxTotalWalSize() > 0) {
+            this.dbOptions.setMaxTotalWalSize(config.maxTotalWalSize());
+        }
 
         this.writeOptions = new WriteOptions().setSync(config.syncWrites());
 
@@ -285,9 +299,17 @@ public final class RocksDatabase {
             // reinterpret existing keys, which is unrecoverable.
             checkFormatVersion();
             this.dimensionRegistry = new DimensionRegistry(this.db, metaCf());
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             // An unusable database means keys cannot be interpreted, so refuse to
             // serve rather than write chunks that cannot be read back.
+            //
+            // RuntimeException is caught as well as IOException, and that is
+            // load-bearing: DimensionRegistry.decodeInt throws IllegalStateException
+            // on a corrupt ordinal, and columnFamilyFor throws on a missing family.
+            // Letting either escape here would leak the native handle -- and with it
+            // RocksDB's on-disk LOCK -- so every later open in the same JVM would
+            // fail with a lock error and the obvious "restart and retry" would not
+            // work without killing the JVM.
             closeNative();
             throw e;
         }
@@ -340,13 +362,6 @@ public final class RocksDatabase {
     boolean isClosed() {
         synchronized (LOCK) {
             return this.closed;
-        }
-    }
-
-    /** Visible for tests: number of distinct databases currently open. */
-    static int openCount() {
-        synchronized (LOCK) {
-            return OPEN.size();
         }
     }
 
@@ -441,9 +456,27 @@ public final class RocksDatabase {
         return this.path;
     }
 
-    /** The world this database belongs to; used as the {@code database} label. */
+    /** The world root this database serves, canonicalised. */
+    public File worldRoot() {
+        return this.worldRoot;
+    }
+
+    /**
+     * Identifies this database, for the {@code database} metric label and log lines.
+     *
+     * <p>The full canonical world path, not the directory's short name. The short
+     * name collided: a host running two worlds at {@code /srv/a/world} and
+     * {@code /srv/b/world} produced two series with identical labels, and the
+     * Prometheus client rejects that with {@code DuplicateLabelsException} -- so the
+     * <em>entire</em> {@code /metrics} scrape failed, not merely the one series.
+     * Monitoring went dark exactly on the multi-world setups most likely to need it.
+     *
+     * <p>Long labels are the lesser evil. Dashboards use this as a grouping key
+     * rather than matching a literal, so they keep working; anything shorter is
+     * either ambiguous again or a hash an operator cannot read.
+     */
     public String name() {
-        return this.worldRoot.getName();
+        return this.worldRoot.getPath();
     }
 
     // ------------------------------------------------------------- durability

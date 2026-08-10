@@ -231,9 +231,19 @@ migration forever.
 | `state` | dim + id | `data/<id>.dat` | LSM + dictionary |
 | `meta` | fixed keys | `level.dat` (mirror only) | LSM |
 
-`level.dat` stays a real file: vanilla reads it *before* a session exists, but the
-database can only open after the session lock is acquired. `session.lock` is
-likewise retained — vanilla and every third-party tool check for it.
+`level.dat` stays a real file, but **not for the reason previously stated here.** An
+earlier version of this section claimed vanilla reads it before a session exists, and
+that is wrong for the dedicated server: `Main.java:110` acquires the session lock
+inside `LevelStorage.Session`'s constructor, and the first read is
+`MinecraftServer.convertLevel` on the very next line. Every read entry point also
+calls `checkValid()` first. So `level.dat` *is* lock-protected, and the stated blocker
+does not exist.
+
+The real reasons to leave it alone are narrower: it embeds codec-encoded
+`WorldGenSettings` and the datapack list, which must round-trip byte-identically or
+the world generates differently, and the `level.dat_old` fallback is a genuine
+recovery mechanism a database has no analogue for. `session.lock` is retained
+regardless — vanilla and every third-party tool check for it.
 
 `state` is a quiet win: vanilla allocates one small `.dat` file per in-game map,
 so long-lived worlds accumulate thousands of tiny files.
@@ -314,6 +324,31 @@ Databases written by builds before Phase 2 (one per `(dimension, leaf)`, at
 `<dir>.rocksdb`) cannot be opened; the server refuses to start and names the
 re-import command. The old directories are left untouched, so older builds and
 `backend=anvil` both still work.
+
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/rocksmc stats` | Per-store IO and per-database state, on demand rather than waiting for the log timer |
+| `/rocksmc dimensions` | The persisted dimension-to-ordinal mapping |
+| `/rocksmc flush` | Flush memtables to SST files |
+| `/rocksmc compact` | Compact the whole keyspace and collect obsolete blobs |
+| `/rocksmc checkpoint [name]` | Consistent snapshot under `<world>/rocksmc-checkpoints/` |
+
+All require permission level 4. `flush`, `compact` and `checkpoint` run on a
+background thread and report to the server log when they finish, because a compaction
+of a real 1.1 GB database is not instant and running it on the server thread would
+stall every player. Only one runs at a time; a second request is refused rather than
+queued.
+
+⚠️ A checkpoint is hard-link based — measured at **0 ms on a real 1.1 GB database** —
+so it costs almost nothing and needs no pause, which is the capability Anvil
+structurally cannot offer. But the links share blocks with the live database, so it
+protects against logical corruption and bad deploys, **not** against losing the drive.
+It is not an off-device backup.
+
+Registered by mixing into `CommandManager`'s constructor rather than via
+`CommandRegistrationCallback`, so the mod still needs no `fabric-api` dependency.
 
 ## Metrics
 

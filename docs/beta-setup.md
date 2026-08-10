@@ -14,20 +14,21 @@ Verified against a real 293,207-chunk technical-server world:
 | | |
 |---|---|
 | Chunk read/write | ✅ 293,207/293,207 round-tripped, zero mismatches |
-| Custom dimensions | ✅ identity derived from save directory, 43 unit tests |
+| Custom dimensions | ✅ identity derived from save directory; key encoding verified for negative coordinates |
 | World import | ✅ verified read-back, source `.mca` never modified |
 | **One database per world** | ✅ 6 stores share one handle; verified live and under load |
 | **Crash recovery** | ✅ four `kill -9` cycles mid-autosave; all dimensions recovered to **one** consistent point, 293,207 entries intact |
-| Metrics + logging | ✅ Prometheus on `/metrics`, periodic log lines |
+| Metrics + logging | ✅ Prometheus on `/metrics`, periodic log lines, `/rocksmc stats` on demand |
 | Format version guard | ✅ refuses to open a database from another build |
 | Legacy-layout guard | ✅ refuses to start on a v1 world, naming the re-import command |
 | Blank-world guard | ✅ refuses to regenerate terrain over a populated world |
+| **POI under a live server** | ✅ exercised with villagers; professions and beds survive a restart |
+| **Checkpoints** | ✅ `/rocksmc checkpoint`, 4 ms on a 1.1 GB database; restore verified to recover all 293,207 entries |
 
 Known gaps — none block a beta, all matter operationally:
 
 | Gap | Consequence |
 |---|---|
-| **POI never exercised by a live server** | The dev run wrote 0 POI chunks. Villagers, beds and workstations go through a 16-section split path that has only been tested via the harness and the importer |
 | **Chunk and POI are not atomic with respect to each other** | One database means one write-ahead log and therefore one *recovery point*, which is what the crash test verifies. It does **not** batch a chunk write together with its POI write: those originate in independent `StorageIoWorker`s above the seam this mod injects at. A crash can still land between them |
 | **`playerdata`, `data/`, `level.dat` are still flat files** (Phase 3) | Backups must capture them *and* the database |
 | **No `.mca` interop** (Phase 5) | Amulet, Chunker, BlueMap/Dynmap and pregenerators cannot read the result |
@@ -189,7 +190,61 @@ project has so far turned out wrong. Use the metrics below to correct them.
 Also note: **`sync-chunk-writes` in `server.properties` has no effect** with this
 backend. The mod logs a warning about it at startup.
 
-## 5. Monitoring
+## 5. Commands
+
+Available in-game or from the console, all at permission level 4:
+
+```
+/rocksmc stats                  per-store IO and per-database state
+/rocksmc dimensions             the dimension -> ordinal mapping
+/rocksmc flush                  flush memtables to SST files
+/rocksmc compact                compact the keyspace, collect obsolete blobs
+/rocksmc checkpoint [name]      consistent snapshot, near-instant
+```
+
+`flush`, `compact` and `checkpoint` run in the background and report to the server
+log; only one runs at a time. `stats` answers immediately.
+
+`/rocksmc stats` is the fastest way to answer "is it healthy right now" without
+waiting up to `stats-log-interval-seconds` for the next log line or standing up
+Prometheus. It surfaces stopped writes and throttling explicitly rather than leaving
+them in a wall of numbers.
+
+### Checkpoints
+
+```
+/rocksmc checkpoint before-upgrade
+```
+
+Creates `<world>/rocksmc-checkpoints/before-upgrade`, or a UTC timestamp if no name
+is given. Measured at **0 ms on a real 1.1 GB database**, because it only creates hard
+links — so taking one before any risky operation costs nothing.
+
+To restore: stop the server, move the live `rocksmc.db` aside, and copy the checkpoint
+into its place.
+
+```bash
+# server stopped
+mv /srv/mc-beta/world/rocksmc.db /srv/mc-beta/world/rocksmc.db.broken
+cp -r /srv/mc-beta/world/rocksmc-checkpoints/before-upgrade \
+      /srv/mc-beta/world/rocksmc.db
+```
+
+⚠️ **Two limits worth understanding before relying on this.**
+
+1. **A checkpoint is not an off-device backup.** The hard links share blocks with the
+   live database, so it protects against logical corruption, a bad deploy or a botched
+   command — not against losing the drive. Keep the `.mca` files and take real backups
+   too.
+2. **Checkpoints pin disk space.** Each one holds references to the SST and blob files
+   live at the time, so obsolete files cannot be reclaimed while a checkpoint
+   referencing them exists. Frequent checkpoints with a long retention will grow the
+   world directory as compaction rewrites data. That is what `checkpoint-keep` is for.
+
+`cp -r` deliberately, not `mv`: copying leaves the checkpoint intact so a failed
+restore can be retried.
+
+## 6. Monitoring
 
 ```
 http://127.0.0.1:9940/metrics
@@ -275,7 +330,7 @@ Periodic log lines are kept alongside Prometheus deliberately: a log survives in
 an archive after a crash, whereas a scrape only exists if something was collecting
 at the time.
 
-## 6. Backup and rollback
+## 7. Backup and rollback
 
 Back up **all** of these together — the database alone is not a world:
 
@@ -301,7 +356,7 @@ and is lost — which is the expected trade.
 
 Keep the `.mca` files for the whole beta. They are the rollback.
 
-## 7. Pre-flight checklist
+## 8. Pre-flight checklist
 
 - [ ] `chattr +C` applied to the world directory **while empty**, confirmed with `lsattr -d`
 - [ ] btrfs compression off, `autodefrag` off, `noatime` on
@@ -316,14 +371,14 @@ Keep the `.mca` files for the whole beta. They are the rollback.
 - [ ] Rollback rehearsed once: flip to `anvil`, confirm the world still loads
 - [ ] Players told the world may be rolled back
 
-## 8. First-week watchlist
+## 9. First-week watchlist
 
 Given what is untested, these are the specific things to check rather than
 waiting for a report:
 
-1. **Villagers.** The POI path has never run under a live server, only via the
-   importer and the harness. Confirm villagers keep professions and beds across a
-   restart, and that `rocksmc_chunk_writes_total{store="poi"}` becomes non-zero.
+1. **Take a checkpoint before anything risky.** `/rocksmc checkpoint before-x` costs
+   4 ms. Do it before a datapack change, a mod update or a mass world edit — it is the
+   cheapest insurance available, and the restore path is a directory copy.
 2. **A hard kill.** Already verified here — four `kill -9` cycles mid-autosave
    recovered every dimension to one consistent point with all 293,207 entries
    intact. Repeat it on your own hardware and filesystem anyway, early, while you

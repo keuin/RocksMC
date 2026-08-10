@@ -4,6 +4,7 @@ import net.fabricmc.api.DedicatedServerModInitializer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -158,6 +159,19 @@ public final class RocksMc implements DedicatedServerModInitializer {
         }
     }
 
+    /**
+     * Loads the configuration, refusing to guess when the stakes are high.
+     *
+     * <p>An unreadable config used to fall back to {@link RocksMcConfig#defaults()},
+     * which means {@code backend=anvil}. On a world already migrated to RocksDB that
+     * is silent data loss in slow motion: vanilla reads the {@code .mca} files, which
+     * are frozen at the moment of the import, and every session since then is
+     * invisible. So if a database is present and the config cannot be read, this
+     * aborts instead.
+     *
+     * <p>A missing config file is different and stays benign -- it means a fresh
+     * install, so the default is written and {@code anvil} is genuinely correct.
+     */
     private static RocksMcConfig loadConfig() {
         Path file = Paths.get("config", MOD_ID + ".properties");
         if (!Files.isRegularFile(file)) {
@@ -168,10 +182,39 @@ public final class RocksMc implements DedicatedServerModInitializer {
         try (InputStream in = Files.newInputStream(file)) {
             props.load(in);
         } catch (IOException e) {
+            if (databasePresent()) {
+                throw new RuntimeException("rocksmc: cannot read " + file
+                    + ", and a RocksDB database exists in this world. Refusing to "
+                    + "start: falling back to the anvil backend would serve the .mca "
+                    + "files as they were at import time and silently discard "
+                    + "everything played since. Fix or delete the config file.", e);
+            }
             LOGGER.error("Could not read {}, using defaults", file, e);
             return RocksMcConfig.defaults();
         }
         return RocksMcConfig.of(props);
+    }
+
+    /**
+     * Whether any world beside the server directory already holds a database.
+     *
+     * <p>Deliberately a shallow filesystem check rather than anything that needs the
+     * config: it runs precisely when the config is unusable. The level name is not
+     * known here either, so this looks for {@code rocksmc.db} one level down, which
+     * covers the standard layout ({@code world/rocksmc.db}) without opening anything.
+     */
+    private static boolean databasePresent() {
+        File[] candidates = new File(".").listFiles();
+        if (candidates == null) {
+            return false;
+        }
+        for (File candidate : candidates) {
+            if (candidate.isDirectory()
+                    && new File(candidate, RocksDatabase.DIRECTORY_NAME).isDirectory()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void writeDefaultConfig(Path file) {
@@ -191,8 +234,8 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "# 1024 essentially every chunk goes to a blob file.\n"
             + "#\n"
             + "# Measured at real LSM depth, this is a near-symmetric trade rather\n"
-            + "# than a clear win: blob files write ~8.5%% fewer bytes but store\n"
-            + "# ~8.6%% more on disk, because they ignore the compression level and\n"
+            + "# than a clear win: blob files write ~8.5% fewer bytes but store\n"
+            + "# ~8.6% more on disk, because they ignore the compression level and\n"
             + "# dictionary settings so the LSM arm compresses better. Raise this\n"
             + "# above chunk size (e.g. 1048576) to favour storage over endurance.\n"
             + "min-blob-size=1024\n"
@@ -270,6 +313,46 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "# default of 8: fast storage drains L0 quickly, so throttling early\n"
             + "# costs tick time for no benefit.\n"
             + "level0-slowdown-writes-trigger=20\n"
+            + "\n"
+            + "# L0 file count at which writes stop entirely. Must stay at or above\n"
+            + "# the slowdown trigger, or writes stall without being throttled first;\n"
+            + "# the mod corrects that combination and warns rather than allowing it.\n"
+            + "level0-stop-writes-trigger=36\n"
+            + "\n"
+            + "# Cap on simultaneously open SST and blob files. -1 is RocksDB's own\n"
+            + "# default (unlimited), which is fine on a dedicated host but can drift\n"
+            + "# into the process file-descriptor limit on a shared one, failing days\n"
+            + "# later with 'too many open files'. Set a bound if ulimit -n is low.\n"
+            + "max-open-files=-1\n"
+            + "\n"
+            + "# Total write-ahead-log bytes before a memtable flush is forced.\n"
+            + "# 0 leaves RocksDB's default. With sync-writes=false the WAL IS the\n"
+            + "# durability mechanism, so bounding it bounds recovery time and the\n"
+            + "# disk a mostly-idle world can hold.\n"
+            + "max-total-wal-size=0\n"
+            + "\n"
+            + "# ---------------------------------------------------------------------\n"
+            + "# Checkpoints (rollback safety net)\n"
+            + "#\n"
+            + "# Hard-link based, so near-instant and almost free: measured at 0 ms on\n"
+            + "# a real 1.1 GB database. Unlike a filesystem snapshot of a live Anvil\n"
+            + "# world, a checkpoint is consistent by construction and needs no pause.\n"
+            + "#\n"
+            + "# WARNING: the links share blocks with the live database, so this\n"
+            + "# protects against logical corruption and bad deploys, NOT against\n"
+            + "# losing the drive. It is not an off-device backup.\n"
+            + "#\n"
+            + "# Retention matters: a checkpoint pins the files it references, so\n"
+            + "# obsolete SSTs and blobs cannot be reclaimed while it exists.\n"
+            + "# Keeping them forever turns 'free' into unbounded growth.\n"
+            + "# ---------------------------------------------------------------------\n"
+            + "\n"
+            + "# Minutes between automatic checkpoints; 0 disables. Manual ones are\n"
+            + "# always available via /rocksmc checkpoint.\n"
+            + "checkpoint-interval-minutes=0\n"
+            + "\n"
+            + "# How many automatic checkpoints to keep; the oldest are pruned.\n"
+            + "checkpoint-keep=6\n"
             + "\n"
             + "# ---------------------------------------------------------------------\n"
             + "# Telemetry\n"

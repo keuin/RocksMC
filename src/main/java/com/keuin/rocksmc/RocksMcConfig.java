@@ -1,7 +1,13 @@
 package com.keuin.rocksmc;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Configuration, read from {@code config/rocksmc.properties}.
@@ -28,6 +34,37 @@ public final class RocksMcConfig {
         ROCKSDB
     }
 
+    /**
+     * Every key this build understands.
+     *
+     * <p>Kept as data so {@link #warnAboutUnknownKeys} can tell an operator that
+     * {@code max-background-job} is not a setting. A silently ignored typo in a
+     * tuning key is invisible: the value simply has no effect and the operator
+     * concludes the setting does not work.
+     */
+    private static final Set<String> KNOWN_KEYS = new LinkedHashSet<>(Arrays.asList(
+        "backend",
+        "min-blob-size",
+        "sync-writes",
+        "verify-on-read",
+        "allow-blank-start",
+        "max-background-jobs",
+        "max-subcompactions",
+        "write-buffer-size",
+        "max-write-buffer-number",
+        "bytes-per-sync",
+        "block-cache-size",
+        "level0-slowdown-writes-trigger",
+        "level0-stop-writes-trigger",
+        "max-open-files",
+        "max-total-wal-size",
+        "metrics-enabled",
+        "metrics-bind",
+        "metrics-port",
+        "stats-log-interval-seconds",
+        "checkpoint-interval-minutes",
+        "checkpoint-keep"));
+
     private final Backend backend;
     private final long minBlobSize;
     private final boolean syncWrites;
@@ -41,34 +78,96 @@ public final class RocksMcConfig {
     private final long bytesPerSync;
     private final long blockCacheSize;
     private final int level0SlowdownTrigger;
+    private final int level0StopTrigger;
+    private final int maxOpenFiles;
+    private final long maxTotalWalSize;
 
     private final boolean metricsEnabled;
     private final String metricsBind;
     private final int metricsPort;
     private final int statsLogIntervalSeconds;
 
-    private RocksMcConfig(Backend backend, long minBlobSize, boolean syncWrites,
-            boolean verifyOnRead, boolean allowBlankStart, int maxBackgroundJobs,
-            int maxSubcompactions, long writeBufferSize, int maxWriteBufferNumber,
-            long bytesPerSync, long blockCacheSize, int level0SlowdownTrigger,
-            boolean metricsEnabled, String metricsBind, int metricsPort,
-            int statsLogIntervalSeconds) {
-        this.backend = backend;
-        this.minBlobSize = minBlobSize;
-        this.syncWrites = syncWrites;
-        this.verifyOnRead = verifyOnRead;
-        this.allowBlankStart = allowBlankStart;
-        this.maxBackgroundJobs = maxBackgroundJobs;
-        this.maxSubcompactions = maxSubcompactions;
-        this.writeBufferSize = writeBufferSize;
-        this.maxWriteBufferNumber = maxWriteBufferNumber;
-        this.bytesPerSync = bytesPerSync;
-        this.blockCacheSize = blockCacheSize;
-        this.level0SlowdownTrigger = level0SlowdownTrigger;
-        this.metricsEnabled = metricsEnabled;
-        this.metricsBind = metricsBind;
-        this.metricsPort = metricsPort;
-        this.statsLogIntervalSeconds = statsLogIntervalSeconds;
+    private final int checkpointIntervalMinutes;
+    private final int checkpointKeep;
+
+    /**
+     * Mutable staging for parsing, so the immutable config needs no 21-argument
+     * constructor. Package-private fields rather than setters: this exists only to
+     * carry values between {@link #of} and the constructor.
+     */
+    private static final class Values {
+        Backend backend = Backend.ANVIL;
+        long minBlobSize = 1024L;
+        boolean syncWrites;
+        boolean verifyOnRead;
+        boolean allowBlankStart;
+        int maxBackgroundJobs = 8;
+        int maxSubcompactions = 4;
+        long writeBufferSize = 128L * 1024 * 1024;
+        int maxWriteBufferNumber = 4;
+        long bytesPerSync = 1024L * 1024;
+        long blockCacheSize = 512L * 1024 * 1024;
+        int level0SlowdownTrigger = 20;
+        int level0StopTrigger = 36;
+        int maxOpenFiles = -1;
+        long maxTotalWalSize;
+        boolean metricsEnabled;
+        String metricsBind = "127.0.0.1";
+        int metricsPort = 9940;
+        int statsLogIntervalSeconds = 300;
+        int checkpointIntervalMinutes;
+        int checkpointKeep = 6;
+    }
+
+    private RocksMcConfig(Values v) {
+        this.backend = v.backend;
+        this.minBlobSize = v.minBlobSize;
+        this.syncWrites = v.syncWrites;
+        this.verifyOnRead = v.verifyOnRead;
+        this.allowBlankStart = v.allowBlankStart;
+        this.maxBackgroundJobs = v.maxBackgroundJobs;
+        this.maxSubcompactions = v.maxSubcompactions;
+        this.writeBufferSize = v.writeBufferSize;
+        this.maxWriteBufferNumber = v.maxWriteBufferNumber;
+        this.bytesPerSync = v.bytesPerSync;
+        this.blockCacheSize = v.blockCacheSize;
+        this.level0SlowdownTrigger = v.level0SlowdownTrigger;
+        this.level0StopTrigger = v.level0StopTrigger;
+        this.maxOpenFiles = v.maxOpenFiles;
+        this.maxTotalWalSize = v.maxTotalWalSize;
+        this.metricsEnabled = v.metricsEnabled;
+        this.metricsBind = v.metricsBind;
+        this.metricsPort = v.metricsPort;
+        this.statsLogIntervalSeconds = v.statsLogIntervalSeconds;
+        this.checkpointIntervalMinutes = v.checkpointIntervalMinutes;
+        this.checkpointKeep = v.checkpointKeep;
+    }
+
+    /** A snapshot of this config's values, for making a modified copy. */
+    private Values values() {
+        Values v = new Values();
+        v.backend = this.backend;
+        v.minBlobSize = this.minBlobSize;
+        v.syncWrites = this.syncWrites;
+        v.verifyOnRead = this.verifyOnRead;
+        v.allowBlankStart = this.allowBlankStart;
+        v.maxBackgroundJobs = this.maxBackgroundJobs;
+        v.maxSubcompactions = this.maxSubcompactions;
+        v.writeBufferSize = this.writeBufferSize;
+        v.maxWriteBufferNumber = this.maxWriteBufferNumber;
+        v.bytesPerSync = this.bytesPerSync;
+        v.blockCacheSize = this.blockCacheSize;
+        v.level0SlowdownTrigger = this.level0SlowdownTrigger;
+        v.level0StopTrigger = this.level0StopTrigger;
+        v.maxOpenFiles = this.maxOpenFiles;
+        v.maxTotalWalSize = this.maxTotalWalSize;
+        v.metricsEnabled = this.metricsEnabled;
+        v.metricsBind = this.metricsBind;
+        v.metricsPort = this.metricsPort;
+        v.statsLogIntervalSeconds = this.statsLogIntervalSeconds;
+        v.checkpointIntervalMinutes = this.checkpointIntervalMinutes;
+        v.checkpointKeep = this.checkpointKeep;
+        return v;
     }
 
     public static RocksMcConfig defaults() {
@@ -83,63 +182,200 @@ public final class RocksMcConfig {
      * one configuration object is shared by every store of a world.
      */
     public RocksMcConfig withVerifyOnRead(boolean value) {
-        return new RocksMcConfig(this.backend, this.minBlobSize, this.syncWrites,
-            value, this.allowBlankStart, this.maxBackgroundJobs, this.maxSubcompactions,
-            this.writeBufferSize, this.maxWriteBufferNumber, this.bytesPerSync,
-            this.blockCacheSize, this.level0SlowdownTrigger, this.metricsEnabled,
-            this.metricsBind, this.metricsPort, this.statsLogIntervalSeconds);
+        Values v = values();
+        v.verifyOnRead = value;
+        return new RocksMcConfig(v);
     }
 
+    /**
+     * Parses a configuration, rejecting what it cannot honour.
+     *
+     * <h2>Why this is strict now</h2>
+     *
+     * <p>Every unparseable value used to fall back to its default in silence. That
+     * is the wrong trade for storage configuration, and one case was outright
+     * dangerous: {@code backend=rocksb} became {@code ANVIL}, after which the mod
+     * logged the cheerful "Backend is 'anvil' (vanilla)" line and an operator who
+     * believed they had migrated was running vanilla against stale region files.
+     *
+     * <p>So an unusable {@code backend} now throws, and everything else warns loudly
+     * and continues. The asymmetry is deliberate: getting the backend wrong changes
+     * which data the server reads, whereas getting a tuning number wrong only makes
+     * it slower.
+     *
+     * @throws IllegalArgumentException if {@code backend} is present but unusable
+     */
     public static RocksMcConfig of(Properties props) {
-        Backend backend;
-        try {
-            backend = Backend.valueOf(
-                props.getProperty("backend", "anvil").trim().toUpperCase(Locale.ROOT));
-        } catch (IllegalArgumentException e) {
-            backend = Backend.ANVIL;
+        Values v = new Values();
+
+        String rawBackend = props.getProperty("backend");
+        if (rawBackend != null && !rawBackend.trim().isEmpty()) {
+            try {
+                v.backend = Backend.valueOf(rawBackend.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("rocksmc: backend=" + rawBackend.trim()
+                    + " is not a valid backend. Use 'anvil' or 'rocksdb'. Refusing to "
+                    + "guess, because silently choosing anvil on a world already "
+                    + "migrated to RocksDB would serve stale .mca data.");
+            }
         }
-        return new RocksMcConfig(
-            backend,
-            parseLong(props, "min-blob-size", 1024L),
-            parseBool(props, "sync-writes", false),
-            parseBool(props, "verify-on-read", false),
-            parseBool(props, "allow-blank-start", false),
-            parseInt(props, "max-background-jobs", 8),
-            parseInt(props, "max-subcompactions", 4),
-            parseLong(props, "write-buffer-size", 128L * 1024 * 1024),
-            parseInt(props, "max-write-buffer-number", 4),
-            parseLong(props, "bytes-per-sync", 1024L * 1024),
-            parseLong(props, "block-cache-size", 512L * 1024 * 1024),
-            parseInt(props, "level0-slowdown-writes-trigger", 20),
-            parseBool(props, "metrics-enabled", false),
-            props.getProperty("metrics-bind", "127.0.0.1").trim(),
-            parseInt(props, "metrics-port", 9940),
-            parseInt(props, "stats-log-interval-seconds", 300));
+
+        v.minBlobSize = parseLong(props, "min-blob-size", v.minBlobSize, 0L, Long.MAX_VALUE);
+        v.syncWrites = parseBool(props, "sync-writes", v.syncWrites);
+        v.verifyOnRead = parseBool(props, "verify-on-read", v.verifyOnRead);
+        v.allowBlankStart = parseBool(props, "allow-blank-start", v.allowBlankStart);
+
+        v.maxBackgroundJobs = parseInt(props, "max-background-jobs",
+            v.maxBackgroundJobs, 1, 256);
+        v.maxSubcompactions = parseInt(props, "max-subcompactions",
+            v.maxSubcompactions, 1, 256);
+        v.writeBufferSize = parseLong(props, "write-buffer-size",
+            v.writeBufferSize, 64L * 1024, Long.MAX_VALUE);
+        v.maxWriteBufferNumber = parseInt(props, "max-write-buffer-number",
+            v.maxWriteBufferNumber, 2, 256);
+        v.bytesPerSync = parseLong(props, "bytes-per-sync", v.bytesPerSync, 0L, Long.MAX_VALUE);
+        v.blockCacheSize = parseLong(props, "block-cache-size",
+            v.blockCacheSize, 1024L * 1024, Long.MAX_VALUE);
+        v.level0SlowdownTrigger = parseInt(props, "level0-slowdown-writes-trigger",
+            v.level0SlowdownTrigger, 1, 1_000_000);
+        v.level0StopTrigger = parseInt(props, "level0-stop-writes-trigger",
+            v.level0StopTrigger, 1, 1_000_000);
+        v.maxOpenFiles = parseInt(props, "max-open-files", v.maxOpenFiles, -1, 1_000_000);
+        v.maxTotalWalSize = parseLong(props, "max-total-wal-size",
+            v.maxTotalWalSize, 0L, Long.MAX_VALUE);
+
+        v.metricsEnabled = parseBool(props, "metrics-enabled", v.metricsEnabled);
+        v.metricsBind = props.getProperty("metrics-bind", v.metricsBind).trim();
+        v.metricsPort = parseInt(props, "metrics-port", v.metricsPort, 1, 65535);
+        v.statsLogIntervalSeconds = parseInt(props, "stats-log-interval-seconds",
+            v.statsLogIntervalSeconds, 0, Integer.MAX_VALUE);
+
+        v.checkpointIntervalMinutes = parseInt(props, "checkpoint-interval-minutes",
+            v.checkpointIntervalMinutes, 0, Integer.MAX_VALUE);
+        v.checkpointKeep = parseInt(props, "checkpoint-keep", v.checkpointKeep, 1, 10_000);
+
+        // Throttling must begin before it stops, or RocksDB never gets the chance to
+        // slow writes gently and jumps straight to a full stall. Easy to get wrong by
+        // raising only the slowdown trigger, which the docs actively suggest doing.
+        if (v.level0SlowdownTrigger > v.level0StopTrigger) {
+            warn("level0-slowdown-writes-trigger (" + v.level0SlowdownTrigger
+                + ") exceeds level0-stop-writes-trigger (" + v.level0StopTrigger
+                + "), which would stall writes without throttling first. Raising the "
+                + "stop trigger to match.");
+            v.level0StopTrigger = v.level0SlowdownTrigger;
+        }
+
+        warnAboutUnknownKeys(props);
+        return new RocksMcConfig(v);
     }
 
-    private static long parseLong(Properties props, String key, long fallback) {
+    /**
+     * Warns about keys this build does not read.
+     *
+     * <p>A misspelled tuning key is otherwise invisible: the value has no effect and
+     * the operator concludes the setting is broken rather than misspelled.
+     */
+    private static void warnAboutUnknownKeys(Properties props) {
+        List<String> unknown = new ArrayList<>();
+        for (String name : props.stringPropertyNames()) {
+            if (!KNOWN_KEYS.contains(name)) {
+                unknown.add(name);
+            }
+        }
+        if (!unknown.isEmpty()) {
+            Collections.sort(unknown);
+            warn("ignoring unrecognised setting(s): " + String.join(", ", unknown)
+                + ". Valid keys: " + String.join(", ", KNOWN_KEYS));
+        }
+    }
+
+    /**
+     * Parses a long, warning rather than silently defaulting.
+     *
+     * <p>Also range-checks: these values go straight into RocksDB's native options,
+     * where a zero block cache or a negative thread count is at best rejected deep in
+     * JNI and at worst accepted with surprising behaviour.
+     */
+    private static long parseLong(Properties props, String key, long fallback,
+            long min, long max) {
         String s = props.getProperty(key);
-        if (s == null) {
+        if (s == null || s.trim().isEmpty()) {
             return fallback;
         }
+        long parsed;
         try {
-            return Long.parseLong(s.trim());
+            parsed = Long.parseLong(s.trim());
         } catch (NumberFormatException e) {
+            warn(key + '=' + s.trim() + " is not a number (note: suffixes like 'M' or "
+                + "'GiB' are not supported, give plain bytes). Using " + fallback + '.');
             return fallback;
         }
+        if (parsed < min || parsed > max) {
+            warn(key + '=' + parsed + " is outside the usable range [" + min + ", "
+                + max + "]. Using " + fallback + '.');
+            return fallback;
+        }
+        return parsed;
     }
 
-    private static int parseInt(Properties props, String key, int fallback) {
-        return (int) parseLong(props, key, fallback);
+    /**
+     * Parses an int with the same strictness.
+     *
+     * <p>Bounds are checked as a {@code long} before narrowing, so a value above
+     * {@code Integer.MAX_VALUE} is reported rather than silently wrapping -- the old
+     * cast turned {@code max-background-jobs=4294967304} into {@code 8}.
+     */
+    private static int parseInt(Properties props, String key, int fallback,
+            int min, int max) {
+        return (int) parseLong(props, key, fallback, min, max);
     }
 
+    /**
+     * Parses a boolean, warning on anything that is not clearly true or false.
+     *
+     * <p>{@code Boolean.parseBoolean} maps every unrecognised string to {@code false},
+     * so {@code sync-writes=1} and {@code sync-writes=yes} both silently meant
+     * {@code false} -- the opposite of what the operator wrote.
+     */
     private static boolean parseBool(Properties props, String key, boolean fallback) {
         String s = props.getProperty(key);
-        return s == null ? fallback : Boolean.parseBoolean(s.trim());
+        if (s == null || s.trim().isEmpty()) {
+            return fallback;
+        }
+        String value = s.trim().toLowerCase(Locale.ROOT);
+        if ("true".equals(value)) {
+            return true;
+        }
+        if ("false".equals(value)) {
+            return false;
+        }
+        warn(key + '=' + s.trim() + " is not a boolean; use 'true' or 'false'. Using "
+            + fallback + '.');
+        return fallback;
+    }
+
+    /**
+     * Reports a configuration problem.
+     *
+     * <p>Goes through the mod logger when one is available and falls back to stderr,
+     * because {@link #of} is also called by the standalone importer and fidelity
+     * tools, which run without log4j configured.
+     */
+    private static void warn(String message) {
+        try {
+            RocksMc.logger().warn("rocksmc config: {}", message);
+        } catch (RuntimeException | LinkageError e) {
+            System.err.println("rocksmc config: " + message);
+        }
     }
 
     public Backend backend() {
         return this.backend;
+    }
+
+    /** The backend's name in lower case, for messages an operator reads. */
+    public String backendName() {
+        return this.backend.name().toLowerCase(Locale.ROOT);
     }
 
     public boolean rocksEnabled() {
@@ -275,6 +511,66 @@ public final class RocksMcConfig {
         return this.level0SlowdownTrigger;
     }
 
+    /**
+     * L0 file count at which writes stop entirely.
+     *
+     * <p>Exposed because it must stay at or above {@link #level0SlowdownTrigger()};
+     * raising only the slowdown trigger past this would skip throttling and jump
+     * straight to a stall. {@link #of} corrects that combination rather than letting
+     * it through.
+     */
+    public int level0StopTrigger() {
+        return this.level0StopTrigger;
+    }
+
+    /**
+     * Cap on simultaneously open SST and blob files, or {@code -1} for unlimited.
+     *
+     * <p>RocksDB's own default is unlimited, which is fine on a dedicated host and a
+     * slow leak toward {@code RLIMIT_NOFILE} on a shared one: a large world's blob
+     * files accumulate, and the process dies days later with "too many open files"
+     * nowhere near the change that caused it. Left unlimited by default so behaviour
+     * does not change silently, but now settable.
+     */
+    public int maxOpenFiles() {
+        return this.maxOpenFiles;
+    }
+
+    /**
+     * Total WAL bytes before RocksDB forces a memtable flush, or 0 for its default.
+     *
+     * <p>Matters because {@code sync-writes=false} makes the WAL the durability
+     * mechanism, and an idle-but-open world can otherwise hold a large WAL
+     * indefinitely. Setting this bounds both recovery time and disk use.
+     */
+    public long maxTotalWalSize() {
+        return this.maxTotalWalSize;
+    }
+
+    /**
+     * Minutes between automatic checkpoints, or 0 to disable.
+     *
+     * <p>Checkpoints are hard-link based: measured at 0 ms on a real 1.1 GB database,
+     * sharing blocks with the live files. That makes frequent ones affordable, but
+     * see {@link #checkpointKeep()} -- they pin the SST and blob files they reference,
+     * so space is only reclaimed once a checkpoint is deleted.
+     */
+    public int checkpointIntervalMinutes() {
+        return this.checkpointIntervalMinutes;
+    }
+
+    /**
+     * How many automatic checkpoints to retain; the oldest are pruned.
+     *
+     * <p>Retention is not optional. A checkpoint hard-links the files live at the
+     * time, so obsolete SSTs and blobs cannot be reclaimed while any checkpoint still
+     * references them. Keeping them forever converts "near-free" into unbounded growth
+     * as compaction rewrites data.
+     */
+    public int checkpointKeep() {
+        return this.checkpointKeep;
+    }
+
     /** Whether to serve Prometheus metrics over HTTP. */
     public boolean metricsEnabled() {
         return this.metricsEnabled;
@@ -308,6 +604,13 @@ public final class RocksMcConfig {
             + ", bytesPerSync=" + this.bytesPerSync
             + ", blockCacheSize=" + this.blockCacheSize
             + ", level0SlowdownTrigger=" + this.level0SlowdownTrigger
+            + ", level0StopTrigger=" + this.level0StopTrigger
+            + ", maxOpenFiles=" + this.maxOpenFiles
+            + ", maxTotalWalSize=" + this.maxTotalWalSize
+            + ", checkpoints=" + (this.checkpointIntervalMinutes > 0
+                ? "every " + this.checkpointIntervalMinutes + "min keep "
+                    + this.checkpointKeep
+                : "disabled")
             + ", metrics=" + (this.metricsEnabled
                 ? this.metricsBind + ":" + this.metricsPort : "disabled")
             + ", statsLogIntervalSeconds=" + this.statsLogIntervalSeconds + '}';

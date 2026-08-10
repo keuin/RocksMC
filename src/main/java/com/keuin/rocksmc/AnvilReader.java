@@ -174,23 +174,6 @@ public final class AnvilReader {
     }
 
     /**
-     * Reads every chunk in one region file, collecting them into a list.
-     *
-     * <p>Convenient, but holds a whole region's parsed NBT at once -- tens of MB.
-     * Prefer {@link #stream} where the chunks are consumed as they arrive, which is
-     * what makes a parallel import fit in a sane heap.
-     *
-     * <p>Anomalies are recorded in {@code report} rather than thrown: a single
-     * corrupt entry in a large world should not abort an import, but it must be
-     * counted and surfaced.
-     */
-    public static List<Entry> read(File regionFile, Report report) throws IOException {
-        List<Entry> out = new ArrayList<>();
-        stream(regionFile, report, out::add);
-        return out;
-    }
-
-    /**
      * Reads every chunk in one region file, handing each to {@code consumer}.
      *
      * <p>Only one chunk's payload and parsed NBT is live at a time, so peak memory
