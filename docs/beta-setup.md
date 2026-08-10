@@ -258,6 +258,19 @@ Suggested alerts: `rocksmc_write_stopped > 0`,
 and some scrapers will route a loopback request through the proxy and return
 `503`. Use `curl --noproxy '*'` or add `127.0.0.1` to `NO_PROXY`.
 
+**Protobuf scrapes return 500.** The mod bundles the text-only exposition module to
+keep 2 MB of shaded protobuf out of the jar, so `text/plain` and OpenMetrics work
+and a scraper explicitly demanding `application/vnd.google.protobuf` gets a 500.
+Prometheus negotiates text by default; only an unusual scraper configuration hits
+this.
+
+**If the server refuses to start with `NoClassDefFoundError` on an
+`io.prometheus.*` class**, the mod jar was built with an incomplete bundled-library
+list. That is a build defect rather than a configuration one — rebuild with
+`./gradlew build`, which now runs `verifyBundledLibraries` and fails loudly instead
+of shipping a jar that cannot link. As an immediate workaround,
+`metrics-enabled=false` avoids loading the exporter at all.
+
 Periodic log lines are kept alongside Prometheus deliberately: a log survives in
 an archive after a crash, whereas a scrape only exists if something was collecting
 at the time.

@@ -344,7 +344,20 @@ appear and disappear with the stores they describe.
 All bundled modules are Java 8 bytecode, which the mod requires for Minecraft
 1.16.5. The text-only `exposition-textformats` module is used rather than
 `exposition-formats`, since the latter carries a shaded protobuf for the binary
-OpenMetrics format that this mod never emits — 43 KB instead of 2.0 MB.
+OpenMetrics format that this mod never emits — 43 KB instead of 2.0 MB. The
+consequence, measured against the shipped jar: `text/plain` and OpenMetrics scrapes
+both return 200, while a scraper explicitly demanding
+`application/vnd.google.protobuf` gets a 500. Prometheus negotiates text by default,
+so this only matters to a scraper configured to insist on protobuf.
+
+⚠️ **Libraries are bundled by explicit list, and the list is verified at build
+time.** Loom's `include()` nests only the jars it is given, so an incomplete list
+packages cleanly and then dies on a real server with `NoClassDefFoundError` — which
+happened once, on `exporter-common`. `./gradlew verifyBundledLibraries` (wired into
+`check`, so `build` runs it) unpacks the jar that will ship, loads every bundled
+class in a classloader holding *nothing* else, and then stands the exporter up and
+scrapes it over real HTTP. Both halves are needed: the link scan catches a missing
+class, and the scrape catches one that is only loaded lazily when a request arrives.
 
 A Grafana dashboard is included at
 [`dashboards/rocksmc-overview.json`](dashboards/rocksmc-overview.json). The

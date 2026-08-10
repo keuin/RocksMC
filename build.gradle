@@ -49,21 +49,46 @@ dependencies {
 
     // Prometheus client. Every module is listed explicitly rather than relying on
     // transitive resolution, because Loom's include() nests only what it is given:
-    // a transitively-resolved jar would compile fine and then NoClassDefFoundError
-    // at runtime inside the mod jar.
+    // a transitively-resolved jar compiles fine and then NoClassDefFoundError at
+    // runtime inside the mod jar. That is not hypothetical -- this list was missing
+    // exporter-common and the server died on startup with
+    // NoClassDefFoundError: io/prometheus/metrics/exporter/common/PrometheusHttpExchange
+    // once metrics were enabled. The verifyBundledLibraries task below now fails the
+    // build instead of letting an incomplete list reach a server.
     //
     // All modules are Java 8 bytecode (class file major version 52), which is why
     // this is usable at all -- the mod targets Java 8 for Minecraft 1.16.5.
     //
     // exposition-textformats rather than exposition-formats: the latter bundles a
-    // shaded protobuf 4.35.0 for the binary OpenMetrics format, which this mod
-    // never emits. Choosing the text-only module drops ~2 MB of dead weight from
-    // the shipped jar (43 KB versus 2.0 MB).
+    // shaded protobuf 4.35.0 for the binary OpenMetrics format, which this mod never
+    // emits, and is 2.0 MB against 44 KB. It is excluded rather than merely omitted,
+    // because exporter-common pulls it in transitively. Safe to exclude: the
+    // text-only module ships its own PrometheusProtobufWriter, a reflective stub
+    // that throws UnsupportedOperationException and links against no protobuf class,
+    // so PrometheusScrapeHandler's reference to it resolves without the big jar.
+    //
+    // Measured consequence, verified against the shipped jars: text/plain and
+    // OpenMetrics scrapes both return 200, and a scraper explicitly demanding
+    // application/vnd.google.protobuf gets a 500 rather than crashing the server.
+    // Prometheus negotiates text by default, so this only affects a scraper
+    // configured to insist on protobuf.
+    //
+    // The tracer modules are deliberately NOT bundled. They appear in the resolved
+    // dependency graph via core's ExemplarSampler, but SpanContext occurs only in
+    // its field and method signatures, which never resolve because this mod uses a
+    // MultiCollector and never constructs a Counter or Histogram. Verified: the jar
+    // links without them, and a real HTTP scrape works. Bundling them would be
+    // ~4 KB of cargo cult.
     implementation include("io.prometheus:prometheus-metrics-core:${project.prometheus_version}")
     implementation include("io.prometheus:prometheus-metrics-model:${project.prometheus_version}")
     implementation include("io.prometheus:prometheus-metrics-config:${project.prometheus_version}")
     implementation include("io.prometheus:prometheus-metrics-exposition-textformats:${project.prometheus_version}")
     implementation include("io.prometheus:prometheus-metrics-exporter-httpserver:${project.prometheus_version}")
+    implementation include("io.prometheus:prometheus-metrics-exporter-common:${project.prometheus_version}")
+
+    configurations.configureEach {
+        exclude group: 'io.prometheus', module: 'prometheus-metrics-exposition-formats'
+    }
 
     testImplementation "org.junit.jupiter:junit-jupiter:5.14.4"
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
@@ -112,6 +137,220 @@ jar {
         rename { "${it}_${project.base.archivesName.get()}" }
     }
 }
+
+// ---------------------------------------------------------------------------
+// verifyBundledLibraries: fail the build if a bundled library is missing a class
+// it needs at runtime.
+//
+// Loom's include() nests only the jars it is handed, so an incomplete list
+// compiles and packages cleanly and then dies on a server with
+// NoClassDefFoundError. That happened: exporter-common was missing and the mod
+// crashed the server on startup as soon as metrics were enabled. Unit tests do not
+// catch it either, because they run against the full Gradle classpath rather than
+// the nested jars actually shipped.
+//
+// So this reads back the jar that will be published, loads every nested library in
+// an isolated classloader with NOTHING else on it, and resolves each class's
+// constant pool. A reference that cannot be satisfied from the bundle is a shipping
+// bug and fails the build.
+//
+// Deliberately not a dependency-graph check: the point is not "did we include the
+// whole transitive closure" -- exposition-formats is excluded on purpose -- but "can
+// every class the mod ships actually link". Those are different questions, and only
+// the second one matters to a server operator.
+// ---------------------------------------------------------------------------
+tasks.register('verifyBundledLibraries') {
+    group = 'verification'
+    description = 'Check that bundled libraries can link without external jars.'
+    dependsOn 'remapJar'
+
+    def jarFile = tasks.named('remapJar').flatMap { it.archiveFile }
+    inputs.file(jarFile)
+    // No output; correctness is the product. Marked not-cacheable so it always runs
+    // -- a stale pass here would be worse than no check at all.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        def modJar = jarFile.get().asFile
+        def work = File.createTempDir('rocksmc-verify', '')
+        try {
+            def nested = []
+            new java.util.zip.ZipFile(modJar).withCloseable { zip ->
+                zip.entries().findAll {
+                    it.name.startsWith('META-INF/jars/') && it.name.endsWith('.jar')
+                }.each { entry ->
+                    def out = new File(work, entry.name.substring('META-INF/jars/'.length()))
+                    zip.getInputStream(entry).withStream { input ->
+                        out.withOutputStream { it << input }
+                    }
+                    nested << out
+                }
+            }
+            if (nested.isEmpty()) {
+                throw new GradleException("no nested jars found in ${modJar.name}")
+            }
+
+            // rocksdbjni is 84 MB of platform natives and its Java surface is a
+            // thin JNI layer; scanning it costs far more than it can reveal, and a
+            // missing class there would fail the existing tests immediately.
+            def libs = nested.findAll { !it.name.startsWith('rocksdbjni') }
+            logger.lifecycle("verifying ${libs.size()} bundled libraries " +
+                "(${nested.size()} nested jars total)")
+
+            // The classloader sees the nested jars and the platform only. Anything
+            // resolvable solely because Gradle or Minecraft happens to provide it
+            // would be a false pass, which is the whole failure being guarded.
+            def urls = libs.collect { it.toURI().toURL() } as URL[]
+            def loader = new URLClassLoader(urls, ClassLoader.getPlatformClassLoader())
+
+            def failures = [:]
+            def checked = 0
+            libs.each { lib ->
+                new java.util.zip.ZipFile(lib).withCloseable { zip ->
+                    zip.entries().findAll {
+                        it.name.endsWith('.class') && !it.name.contains('module-info')
+                    }.each { entry ->
+                        def name = entry.name[0..-7].replace('/', '.')
+                        checked++
+                        try {
+                            // initialize=false: linking is what we are testing, and
+                            // running static initialisers would drag in unrelated
+                            // runtime state (and side effects) for no benefit.
+                            Class.forName(name, false, loader)
+                        } catch (Throwable t) {
+                            // NoClassDefFoundError names the missing dependency;
+                            // anything else is recorded verbatim rather than guessed at.
+                            def missing = t instanceof NoClassDefFoundError
+                                ? t.message?.replace('/', '.')
+                                : "${t.class.simpleName}: ${t.message}"
+                            failures.computeIfAbsent(missing, { [] }) << name
+                        }
+                    }
+                }
+            }
+
+            if (!failures.isEmpty()) {
+                def report = new StringBuilder()
+                report << "\n${failures.size()} unsatisfied reference(s) in the mod jar.\n"
+                report << "These would be a NoClassDefFoundError on a real server.\n\n"
+                failures.each { missing, users ->
+                    report << "  MISSING: ${missing}\n"
+                    users.take(5).each { report << "    needed by ${it}\n" }
+                    if (users.size() > 5) {
+                        report << "    ...and ${users.size() - 5} more\n"
+                    }
+                    def module = missing?.startsWith('io.prometheus')
+                        ? 'a prometheus-metrics-* module'
+                        : 'the owning library'
+                    report << "    fix: add ${module} to dependencies as " +
+                        "implementation include(...)\n\n"
+                }
+                throw new GradleException(report.toString())
+            }
+            logger.lifecycle("verifyBundledLibraries: ${checked} classes link " +
+                "using only the bundled jars")
+
+            // Linking is necessary but NOT sufficient: a class loaded lazily on the
+            // first scrape would still pass the scan above and then fail on a live
+            // server. So actually stand the exporter up and scrape it, over real
+            // HTTP, with only the bundled jars visible.
+            def smokeDir = new File(work, 'smoke')
+            smokeDir.mkdirs()
+            def smokeSource = new File(smokeDir, 'BundleSmoke.java')
+            smokeSource.text = '''
+import io.prometheus.metrics.exporter.httpserver.HTTPServer;
+import io.prometheus.metrics.model.registry.MultiCollector;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import io.prometheus.metrics.model.snapshots.*;
+import java.io.*;
+import java.net.*;
+import java.util.*;
+
+public class BundleSmoke {
+    public static void main(String[] args) throws Exception {
+        PrometheusRegistry registry = new PrometheusRegistry();
+        registry.register(new MultiCollector() {
+            public MetricSnapshots collect() {
+                List<MetricSnapshot> out = new ArrayList<MetricSnapshot>();
+                out.add(GaugeSnapshot.builder().name("rocksmc_up").help("up")
+                    .dataPoint(GaugeSnapshot.GaugeDataPointSnapshot.builder()
+                        .value(1).build()).build());
+                out.add(CounterSnapshot.builder().name("rocksmc_chunk_writes")
+                    .help("writes")
+                    .dataPoint(CounterSnapshot.CounterDataPointSnapshot.builder()
+                        .labels(Labels.of(
+                            new String[] {"dimension", "store", "database"},
+                            new String[] {"minecraft:overworld", "region", "world"}))
+                        .value(42).build()).build());
+                return new MetricSnapshots(out);
+            }
+        });
+        HTTPServer server = HTTPServer.builder().hostname("127.0.0.1").port(0)
+            .registry(registry).buildAndStart();
+        StringBuilder body = new StringBuilder();
+        int code;
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(
+                "http://127.0.0.1:" + server.getPort() + "/metrics").openConnection();
+            c.setRequestProperty("Accept", "text/plain;version=0.0.4");
+            code = c.getResponseCode();
+            BufferedReader r = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), "UTF-8"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                body.append(line).append('\\n');
+            }
+            r.close();
+        } finally {
+            server.close();
+        }
+        String text = body.toString();
+        if (code != 200
+                || !text.contains("rocksmc_up 1")
+                || !text.contains("rocksmc_chunk_writes_total{")
+                || !text.contains("dimension=\\"minecraft:overworld\\"")) {
+            System.err.println("scrape returned HTTP " + code + ":\\n" + text);
+            System.exit(1);
+        }
+        System.out.println("scrape OK, HTTP 200, " + text.split("\\n").length + " lines");
+    }
+}
+'''
+            def cp = libs.collect { it.absolutePath }.join(File.pathSeparator)
+            def classes = new File(work, 'smoke-classes')
+            classes.mkdirs()
+            def javaHome = System.getProperty('java.home')
+            def compile = providers.exec {
+                commandLine "${javaHome}/bin/javac", '-nowarn',
+                    '-d', classes.absolutePath, '-cp', cp, smokeSource.absolutePath
+            }
+            if (compile.result.get().exitValue != 0) {
+                throw new GradleException("smoke test failed to compile against the " +
+                    "bundled jars:\n${compile.standardError.asText.get()}")
+            }
+            def run = providers.exec {
+                commandLine "${javaHome}/bin/java",
+                    '-cp', "${classes.absolutePath}${File.pathSeparator}${cp}",
+                    'BundleSmoke'
+                ignoreExitValue = true
+            }
+            def exit = run.result.get().exitValue
+            def stdout = run.standardOutput.asText.get().trim()
+            def stderr = run.standardError.asText.get().trim()
+            if (exit != 0) {
+                throw new GradleException("the bundled exporter cannot serve a " +
+                    "scrape. This is what a server would hit at runtime:\n" +
+                    "${stdout}\n${stderr}")
+            }
+            logger.lifecycle("verifyBundledLibraries: ${stdout}")
+        } finally {
+            work.deleteDir()
+        }
+    }
+}
+
+// Part of `check`, so `build` cannot produce a jar that fails to link.
+tasks.named('check') { dependsOn 'verifyBundledLibraries' }
 
 // ---------------------------------------------------------------------------
 // importWorld: convert an existing Anvil world into one RocksDB per world.
