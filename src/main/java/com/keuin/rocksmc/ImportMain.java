@@ -1,6 +1,8 @@
 package com.keuin.rocksmc;
 
 import java.io.File;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.util.Properties;
 
 /**
@@ -16,8 +18,10 @@ import java.util.Properties;
  */
 public final class ImportMain {
 
-    /** Separator. A literal because String.repeat is Java 11+ and this
-     * module compiles with options.release = 8. */
+    /**
+     * Separator. A literal because String.repeat is Java 11+ and this
+     * module compiles with options.release = 8.
+     */
     private static final String RULE =
         "--------------------------------------------------------------------------";
 
@@ -127,7 +131,7 @@ public final class ImportMain {
             ? new File(path)
             : new File("config/rocksmc.properties");
         if (file.isFile()) {
-            try (java.io.InputStream in = new java.io.FileInputStream(file)) {
+            try (InputStream in = Files.newInputStream(file.toPath())) {
                 props.load(in);
             }
             System.out.println("  config:    " + file.getAbsolutePath());

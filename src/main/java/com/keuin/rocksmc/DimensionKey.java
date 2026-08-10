@@ -57,7 +57,9 @@ import java.util.regex.Pattern;
  */
 public final class DimensionKey {
 
-    /** Leaf directory names that {@code RegionBasedStorage} is given. */
+    /**
+     * Leaf directory names that {@code RegionBasedStorage} is given.
+     */
     private static final String REGION_LEAF = "region";
     private static final String POI_LEAF = "poi";
 
@@ -123,7 +125,7 @@ public final class DimensionKey {
     private DimensionKey(String identity, String leaf, String root) {
         this.identity = identity;
         this.leaf = leaf;
-        this.root = root;
+        this.root = normalise(root);
     }
 
     /**
@@ -134,7 +136,9 @@ public final class DimensionKey {
         return this.identity;
     }
 
-    /** Which store this directory belongs to: {@code region} or {@code poi}. */
+    /**
+     * Which store this directory belongs to: {@code region} or {@code poi}.
+     */
     public String leaf() {
         return this.leaf;
     }
@@ -156,23 +160,36 @@ public final class DimensionKey {
      *
      * <p>Not canonicalised: this class is a pure function of its input string and
      * must stay testable against paths that do not exist. Redundant {@code .} and
-     * {@code ..} segments are removed, though, because {@code getAbsolutePath()}
-     * leaves them in place -- a server launched with {@code ./world} would otherwise
-     * produce {@code /srv/./world/rocksmc.db} in log lines and error messages, which
-     * looks like a different path to an operator comparing them. Symlinks are
-     * resolved by {@link RocksDatabase#open}, which needs a true identity rather
-     * than a tidy one.
+     * {@code ..} segments <em>are</em> removed, on construction, because
+     * {@code getAbsolutePath()} leaves them in place -- a server launched with
+     * {@code ./world} would otherwise produce {@code /srv/./world/rocksmc.db} in log
+     * lines and error messages, which looks like a different path to an operator
+     * comparing them. Symlinks are resolved by {@link RocksDatabase#open}, which
+     * needs a true identity rather than a tidy one.
      */
     public File root() {
-        return new File(normalise(this.root));
+        return new File(this.root);
     }
 
     /**
-     * Removes redundant path segments without touching the filesystem.
+     * Removes redundant {@code .} and {@code ..} segments without touching the
+     * filesystem.
+     *
+     * <p>Applied in the constructor rather than in {@link #root()} so that the
+     * normalised form is the only form this object holds. Normalising on the way out
+     * instead left {@link #equals} comparing the verbatim string while callers keyed
+     * their maps on the normalised one, so two spellings of a single world compared
+     * unequal while resolving to the same database.
      *
      * <p>{@code Paths.get(...).normalize()} is purely lexical, so it works on paths
-     * that do not exist and cannot throw. It is skipped when the string contains no
-     * separator-adjacent dot at all, which is the overwhelmingly common case.
+     * that do not exist -- which this class must support, since it is a pure function
+     * of its input and is tested against paths that were never created.
+     *
+     * <p>This cannot strip absoluteness in practice: {@link #fromStorageDirectory}
+     * resolves through {@code getAbsolutePath()} before matching, so the root it
+     * passes here is already absolute. {@link #withRoot} may be given a relative
+     * path, but that is harness-only and {@link RocksDatabase#open} canonicalises
+     * whatever it receives.
      */
     private static String normalise(String path) {
         if (path.isEmpty()) {
@@ -180,7 +197,9 @@ public final class DimensionKey {
         }
         try {
             String normalised = Paths.get(path).normalize().toString();
-            // normalize() reduces a lone "/" to "", which would stop being absolute.
+            // Defensive: no input reaching here is known to normalise to empty, but
+            // returning "" would silently retarget the database at the working
+            // directory, so the original is preferred over that.
             return normalised.isEmpty() ? path : normalised;
         } catch (RuntimeException e) {
             // An unparseable path (e.g. a NUL byte) is not worth failing over here;
@@ -265,7 +284,7 @@ public final class DimensionKey {
         if (!(o instanceof DimensionKey)) {
             return false;
         }
-        DimensionKey other = (DimensionKey)o;
+        DimensionKey other = (DimensionKey) o;
         return this.identity.equals(other.identity)
             && this.leaf.equals(other.leaf)
             && this.root.equals(other.root);

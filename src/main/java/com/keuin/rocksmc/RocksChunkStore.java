@@ -247,12 +247,12 @@ public final class RocksChunkStore implements ChunkStore {
     static byte[] key(int dimensionId, ChunkPos pos) {
         long morton = morton(pos.x, pos.z);
         byte[] k = new byte[12];
-        k[0] = (byte)(dimensionId >>> 24);
-        k[1] = (byte)(dimensionId >>> 16);
-        k[2] = (byte)(dimensionId >>> 8);
-        k[3] = (byte)dimensionId;
+        k[0] = (byte) (dimensionId >>> 24);
+        k[1] = (byte) (dimensionId >>> 16);
+        k[2] = (byte) (dimensionId >>> 8);
+        k[3] = (byte) dimensionId;
         for (int i = 0; i < 8; i++) {
-            k[4 + i] = (byte)(morton >>> (8 * (7 - i)));
+            k[4 + i] = (byte) (morton >>> (8 * (7 - i)));
         }
         return k;
     }

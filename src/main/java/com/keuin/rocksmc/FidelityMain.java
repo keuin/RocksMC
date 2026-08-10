@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Stream;
 
 /**
  * Standalone entry point for {@link FidelityHarness}.
@@ -130,7 +131,9 @@ public final class FidelityMain {
         }
     }
 
-    /** Finds every directory containing .mca files, in stable order. */
+    /**
+     * Finds every directory containing .mca files, in stable order.
+     */
     private static List<File> findRegionDirs(File world) {
         List<File> found = new ArrayList<>();
         collect(world, found);
@@ -175,8 +178,8 @@ public final class FidelityMain {
     }
 
     private static void deleteRecursively(Path path) {
-        try {
-            Files.walk(path)
+        try (Stream<Path> paths = Files.walk(path)) {
+            paths
                 .sorted(Comparator.reverseOrder())
                 .forEach(p -> {
                     try {

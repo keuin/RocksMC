@@ -130,7 +130,7 @@ public final class RocksMcConfig {
     }
 
     private static int parseInt(Properties props, String key, int fallback) {
-        return (int)parseLong(props, key, fallback);
+        return (int) parseLong(props, key, fallback);
     }
 
     private static boolean parseBool(Properties props, String key, boolean fallback) {

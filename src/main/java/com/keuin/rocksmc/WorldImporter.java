@@ -5,6 +5,7 @@ import net.minecraft.util.math.ChunkPos;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -238,7 +239,7 @@ public final class WorldImporter {
     static List<File> findStorageDirectories(File worldDir) {
         List<File> found = new ArrayList<>();
         collect(worldDir, found);
-        found.sort((a, b) -> a.getAbsolutePath().compareTo(b.getAbsolutePath()));
+        found.sort(Comparator.comparing(File::getAbsolutePath));
         return found;
     }
 

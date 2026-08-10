@@ -240,6 +240,42 @@ class DimensionKeyTest {
         assertNotEquals(parse("/a/world/region"), parse("/b/world/region"));
     }
 
+    /**
+     * Different spellings of one world must compare equal.
+     *
+     * <p>This is the invariant that ties {@link DimensionKey#equals} to database
+     * identity: {@link RocksDatabase#open} keys on the normalised root, so if two
+     * keys resolve to the same database they must also compare equal. They once did
+     * not — normalisation was applied when reading the root but {@code equals}
+     * compared the verbatim string, so {@code /w/./region} and {@code /w/region}
+     * reported inequality while sharing a handle. Nothing in the suite caught it,
+     * which is why it is asserted directly rather than left implied.
+     */
+    @Test
+    void differentSpellingsOfOneRootAreEqual() {
+        DimensionKey dot = parse("/srv/world/./region");
+        DimensionKey plain = parse("/srv/world/region");
+        DimensionKey dotdot = parse("/srv/other/../world/region");
+
+        assertEquals(plain, dot);
+        assertEquals(plain, dotdot);
+        assertEquals(plain.hashCode(), dot.hashCode(),
+            "equal keys must hash equally or a HashMap will hold both");
+        assertEquals(plain.hashCode(), dotdot.hashCode());
+        assertEquals(plain.root(), dot.root());
+        assertEquals(plain.root(), dotdot.root());
+    }
+
+    /** The same holds for a root supplied out of band by a harness. */
+    @Test
+    void withRootNormalisesToo() {
+        DimensionKey base = parse("/srv/world/region");
+        assertEquals(base.withRoot(new File("/scratch/db")),
+            base.withRoot(new File("/scratch/./db")));
+        assertEquals(base.withRoot(new File("/scratch/db")).hashCode(),
+            base.withRoot(new File("/scratch/./db")).hashCode());
+    }
+
     // ------------------------------------------------------------------- root
 
     /**

@@ -15,6 +15,7 @@ import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
@@ -46,9 +47,13 @@ public final class FidelityHarness {
         public int chunksVerified;
         public int mismatches;
         public int readFailures;
-        /** Sum of compressed chunk payloads, excluding Anvil's sector padding. */
+        /**
+         * Sum of compressed chunk payloads, excluding Anvil's sector padding.
+         */
         public long compressedBytes;
-        /** Actual size of the .mca files, including sector padding and headers. */
+        /**
+         * Actual size of the .mca files, including sector padding and headers.
+         */
         public long anvilOnDisk;
         public long uncompressedBytes;
         public long rocksOnDisk;
@@ -56,12 +61,12 @@ public final class FidelityHarness {
 
         public double deflateRatio() {
             return this.compressedBytes == 0 ? 0
-                : this.uncompressedBytes / (double)this.compressedBytes;
+                : this.uncompressedBytes / (double) this.compressedBytes;
         }
 
         public double rocksRatio() {
             return this.rocksOnDisk == 0 ? 0
-                : this.uncompressedBytes / (double)this.rocksOnDisk;
+                : this.uncompressedBytes / (double) this.rocksOnDisk;
         }
 
         @Override
@@ -81,8 +86,8 @@ public final class FidelityHarness {
                 // RocksDB's real files against Anvil's payload penalises RocksDB
                 // for space Anvil is also using.
                 sb.append(String.format("anvil ON-DISK      = %,d bytes (%.2fx) "
-                    + "[+%.1f%% sector padding]%n",
-                    this.anvilOnDisk, this.uncompressedBytes / (double)this.anvilOnDisk,
+                        + "[+%.1f%% sector padding]%n",
+                    this.anvilOnDisk, this.uncompressedBytes / (double) this.anvilOnDisk,
                     (this.anvilOnDisk - this.compressedBytes) * 100.0 / this.compressedBytes));
             }
             if (this.rocksOnDisk > 0) {
@@ -92,7 +97,7 @@ public final class FidelityHarness {
                     (this.rocksOnDisk - this.compressedBytes) * 100.0 / this.compressedBytes));
                 if (this.anvilOnDisk > 0) {
                     sb.append(String.format("  vs anvil ON-DISK : %+.1f%%   <-- the fair "
-                        + "file-to-file comparison%n",
+                            + "file-to-file comparison%n",
                         (this.rocksOnDisk - this.anvilOnDisk) * 100.0 / this.anvilOnDisk));
                 }
             }
@@ -100,7 +105,9 @@ public final class FidelityHarness {
         }
     }
 
-    /** One chunk as stored by Anvil, already decompressed. */
+    /**
+     * One chunk as stored by Anvil, already decompressed.
+     */
     private static final class RawChunk {
         final ChunkPos pos;
         final int compressedLen;
@@ -118,9 +125,9 @@ public final class FidelityHarness {
     /**
      * Runs the round trip over every region file under {@code regionDir}.
      *
-     * @param regionDir  directory containing {@code r.X.Z.mca}
-     * @param scratchDb  a fresh directory to hold the temporary database
-     * @param limit      stop after this many chunks, or 0 for no limit
+     * @param regionDir directory containing {@code r.X.Z.mca}
+     * @param scratchDb a fresh directory to hold the temporary database
+     * @param limit     stop after this many chunks, or 0 for no limit
      */
     public static Stats run(File regionDir, File scratchDb, int limit) throws IOException {
         Stats stats = new Stats();
@@ -175,7 +182,7 @@ public final class FidelityHarness {
                     if (readBack == null) {
                         stats.readFailures++;
                         stats.mismatchDetails.add(chunk.pos + ": read returned null");
-                    } else if (!equivalent(chunk.nbt, readBack)) {
+                    } else if (!Objects.equals(chunk.nbt, readBack)) /* NBT implements equals */ {
                         stats.mismatches++;
                         if (stats.mismatchDetails.size() < 20) {
                             stats.mismatchDetails.add(
@@ -232,11 +239,11 @@ public final class FidelityHarness {
                 }
                 int offset = packed >>> 8;
                 int sectors = packed & 0xFF;
-                if (offset < 2 || sectors == 0 || (long)offset * SECTOR >= file.length()) {
+                if (offset < 2 || sectors == 0 || (long) offset * SECTOR >= file.length()) {
                     continue;
                 }
 
-                raf.seek((long)offset * SECTOR);
+                raf.seek((long) offset * SECTOR);
                 int declaredLen = raf.readInt();
                 int scheme = raf.readUnsignedByte();
                 if ((scheme & 0x80) != 0 || declaredLen <= 1) {
@@ -297,14 +304,8 @@ public final class FidelityHarness {
     }
 
     /**
-     * NBT equality. {@code NbtCompound.equals} compares its entry map and the
-     * array tags use {@code Arrays.equals}, so this is a genuine deep compare.
+     * Locates the first structural difference, for actionable failure output.
      */
-    private static boolean equivalent(NbtElement a, NbtElement b) {
-        return a == null ? b == null : a.equals(b);
-    }
-
-    /** Locates the first structural difference, for actionable failure output. */
     private static String firstDifference(NbtElement a, NbtElement b, String path) {
         if (a == null || b == null) {
             return path + ": one side null";
@@ -313,8 +314,8 @@ public final class FidelityHarness {
             return path + ": type " + a.getType() + " != " + b.getType();
         }
         if (a instanceof NbtCompound && b instanceof NbtCompound) {
-            NbtCompound ca = (NbtCompound)a;
-            NbtCompound cb = (NbtCompound)b;
+            NbtCompound ca = (NbtCompound) a;
+            NbtCompound cb = (NbtCompound) b;
             for (String key : ca.getKeys()) {
                 if (!cb.contains(key)) {
                     return path + "." + key + ": missing after round trip";

@@ -219,7 +219,7 @@ public final class DimensionRegistry {
 
     private static byte[] encodeInt(int v) {
         return new byte[] {
-            (byte)(v >>> 24), (byte)(v >>> 16), (byte)(v >>> 8), (byte)v
+            (byte) (v >>> 24), (byte) (v >>> 16), (byte) (v >>> 8), (byte) v
         };
     }
 

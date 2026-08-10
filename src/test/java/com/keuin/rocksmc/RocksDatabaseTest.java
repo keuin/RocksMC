@@ -138,6 +138,39 @@ class RocksDatabaseTest {
         }
     }
 
+    /**
+     * Redundant path segments must not split one world across two databases.
+     *
+     * <p>The lexical counterpart to the symlink case above. Note this passes even
+     * without {@code DimensionKey}'s normalisation, because {@link RocksDatabase#open}
+     * canonicalises the root itself — handle sharing was never the broken half. It is
+     * pinned anyway so that the two mechanisms cannot drift: if canonicalisation were
+     * ever dropped in favour of relying on the key, this is what would catch it. Key
+     * equality is covered separately by
+     * {@code DimensionKeyTest.differentSpellingsOfOneRootAreEqual}, which does fail
+     * without the fix.
+     */
+    @Test
+    void redundantPathSegmentsJoinOneDatabase(@TempDir Path tmp) throws Exception {
+        DimensionKey plain = DimensionKey.fromStorageDirectory(
+            new File(tmp.toFile(), "region"));
+        DimensionKey dot = DimensionKey.fromStorageDirectory(
+            new File(tmp.toFile(), "./poi"));
+        DimensionKey dotdot = DimensionKey.fromStorageDirectory(
+            new File(tmp.toFile(), "elsewhere/../DIM-1/region"));
+
+        try (RocksChunkStore a = RocksChunkStore.open(plain, config());
+             RocksChunkStore b = RocksChunkStore.open(dot, config());
+             RocksChunkStore c = RocksChunkStore.open(dotdot, config())) {
+            assertSame(a.database(), b.database(),
+                "'./poi' must not open a second database for the same world");
+            assertSame(a.database(), c.database(),
+                "a '..' segment must not open a second database for the same world");
+            assertEquals(3, a.database().referenceCount());
+            assertEquals(1, StoreRegistry.databaseCount());
+        }
+    }
+
     // ----------------------------------------------------------------- lifecycle
 
     /**

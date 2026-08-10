@@ -153,7 +153,7 @@ public final class AnvilReader {
             report.emptyRegionFiles++;
             return out;
         }
-        if (length < (long)SECTOR * HEADER_SECTORS) {
+        if (length < (long) SECTOR * HEADER_SECTORS) {
             report.truncatedHeaders++;
             return out;
         }
@@ -177,12 +177,12 @@ public final class AnvilReader {
                 int offset = packed >>> 8;
                 int sectors = packed & 0xFF;
                 if (offset < HEADER_SECTORS || sectors == 0
-                        || (long)offset * SECTOR >= length) {
+                        || (long) offset * SECTOR >= length) {
                     report.invalidSectorEntries++;
                     continue;
                 }
 
-                raf.seek((long)offset * SECTOR);
+                raf.seek((long) offset * SECTOR);
                 int declaredLength = raf.readInt();
                 int scheme = raf.readUnsignedByte();
                 boolean external = (scheme & 0x80) != 0;
