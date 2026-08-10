@@ -297,8 +297,12 @@ and POI data in separate column families. Every dimension is converted in a sing
 pass — importing only some of them and then starting a server would let the rest
 regenerate silently.
 
-Measured on a real 293,207-chunk world: **5m 41s**, all chunks verified, resulting
-database **33.9% smaller on disk** than the `.mca` files.
+Measured on a real 293,207-chunk world: **31.6 s** on 24 cores, all chunks
+verified, resulting database **33.9% smaller on disk** than the `.mca` files.
+Imports one region file per worker thread, one per core by default; pass
+`-Pthreads=n` to change it, or `-Pthreads=1` for the sequential path. The
+parallel result was compared against the sequential one key-for-key with every
+value hashed — identical, so the concurrency changes nothing observable.
 
 Oversized `.mcc` chunks are handled — earlier tooling in this project skipped
 them, which would have silently dropped the largest chunks.

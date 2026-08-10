@@ -90,10 +90,16 @@ The importer:
 
 It exits non-zero and tells you not to start the server if anything failed.
 
-Measured on the real world: **293,207 chunks in 5m 41s**, and the resulting
-database is **33.9% smaller on disk** than the `.mca` files (the fair
+Measured on the real world: **293,207 chunks in 31.6 s** on 24 cores, and the
+resulting database is **33.9% smaller on disk** than the `.mca` files (the fair
 file-to-file comparison; sparse dimensions do far better still, the End by 80.9%,
 because Anvil's 4 KiB sector padding hurts them worst).
+
+The import runs one region file per worker thread, one worker per core by default.
+Add `-Pthreads=n` to cap it — worth doing if the machine is also running something
+else, since it will otherwise saturate every core. `-Pthreads=1` gives the old
+sequential behaviour (342 s on the same world) and is the thing to try first if an
+import ever behaves oddly.
 
 ⚠️ Every dimension must be imported **in one pass**, which is what the command
 above does. The blank-start guard checks whether the shared database holds *any*

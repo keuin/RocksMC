@@ -48,6 +48,13 @@ import java.util.zip.InflaterInputStream;
  * file. Earlier code in this project skipped those entries, which is tolerable
  * for a sampling harness but would <em>silently drop terrain</em> during an
  * import. They are read properly here.
+ *
+ * <h2>Thread safety</h2>
+ *
+ * <p>All methods are static and hold no state between calls, so any number of
+ * threads may read different region files concurrently. Each needs its own
+ * {@link Report}, which is not synchronised on the counting path; merge them
+ * afterwards with {@link Report#merge}.
  */
 public final class AnvilReader {
 
@@ -101,6 +108,23 @@ public final class AnvilReader {
                 + this.decompressFailures + this.missingExternalFiles + this.unknownSchemes;
         }
 
+        /**
+         * Folds another report into this one.
+         *
+         * <p>Parallel imports give each task its own report so the counters need no
+         * synchronisation on the hot path, then merge them here. Merging is
+         * {@code synchronized} because several tasks finish concurrently; the
+         * per-task reports they hand over are already done being written to.
+         */
+        public synchronized void merge(Report other) {
+            this.emptyRegionFiles += other.emptyRegionFiles;
+            this.invalidSectorEntries += other.invalidSectorEntries;
+            this.truncatedHeaders += other.truncatedHeaders;
+            this.decompressFailures += other.decompressFailures;
+            this.missingExternalFiles += other.missingExternalFiles;
+            this.unknownSchemes += other.unknownSchemes;
+        }
+
         @Override
         public String toString() {
             if (total() == 0) {
@@ -126,6 +150,18 @@ public final class AnvilReader {
         }
     }
 
+    /**
+     * Receives chunks one at a time as a region file is parsed.
+     *
+     * <p>Exists so a caller can consume a region without the whole region being
+     * resident. That matters for the parallel importer: a fully parsed region is
+     * hundreds of megabytes of {@code NbtCompound} objects, so one per worker thread
+     * would exhaust the heap long before the cores were busy.
+     */
+    public interface EntryConsumer {
+        void accept(Entry entry) throws IOException;
+    }
+
     /** Lists region files in a directory, in stable order. */
     public static List<File> regionFiles(File regionDir) {
         File[] files = regionDir.listFiles((d, n) -> n.endsWith(".mca"));
@@ -138,7 +174,11 @@ public final class AnvilReader {
     }
 
     /**
-     * Reads every chunk in one region file.
+     * Reads every chunk in one region file, collecting them into a list.
+     *
+     * <p>Convenient, but holds a whole region's parsed NBT at once -- tens of MB.
+     * Prefer {@link #stream} where the chunks are consumed as they arrive, which is
+     * what makes a parallel import fit in a sane heap.
      *
      * <p>Anomalies are recorded in {@code report} rather than thrown: a single
      * corrupt entry in a large world should not abort an import, but it must be
@@ -146,16 +186,34 @@ public final class AnvilReader {
      */
     public static List<Entry> read(File regionFile, Report report) throws IOException {
         List<Entry> out = new ArrayList<>();
+        stream(regionFile, report, out::add);
+        return out;
+    }
+
+    /**
+     * Reads every chunk in one region file, handing each to {@code consumer}.
+     *
+     * <p>Only one chunk's payload and parsed NBT is live at a time, so peak memory
+     * is a single chunk rather than a whole region. Anomalies are recorded in
+     * {@code report} rather than thrown.
+     *
+     * <p>Thread-safe with respect to other calls: all state is local, the file is
+     * opened read-only, and {@code NbtIo} carries no static mutable state (it parses
+     * with the stateless {@code NbtTagSizeTracker.EMPTY}). Give each thread its own
+     * {@code report}, then {@link Report#merge} them.
+     */
+    public static void stream(File regionFile, Report report, EntryConsumer consumer)
+            throws IOException {
         long length = regionFile.length();
         if (length == 0) {
             // Vanilla creates region files on demand and leaves them empty until a
             // chunk in that region is written. Not corruption.
             report.emptyRegionFiles++;
-            return out;
+            return;
         }
         if (length < (long) SECTOR * HEADER_SECTORS) {
             report.truncatedHeaders++;
-            return out;
+            return;
         }
 
         String[] parts = regionFile.getName().split("\\.");
@@ -224,11 +282,10 @@ public final class AnvilReader {
                     continue;
                 }
                 if (nbt != null) {
-                    out.add(new Entry(pos, nbt, payload.length, external));
+                    consumer.accept(new Entry(pos, nbt, payload.length, external));
                 }
             }
         }
-        return out;
     }
 
     private static NbtCompound decode(byte[] payload, int scheme, Report report)
