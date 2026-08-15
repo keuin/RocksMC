@@ -113,6 +113,20 @@ class RocksMcCommandTest {
         assertEquals("n/a", RocksMcCommand.bytes(-1));
     }
 
+    /**
+     * Shutdown must be safe with no worker ever started, and repeatable.
+     *
+     * <p>The common case: a server that never ran a maintenance command still runs the
+     * shutdown hook. It must not throw or block. Repeatability matters because the hook
+     * can race other teardown and a second call must be a no-op rather than an error.
+     */
+    @Test
+    void shutdownWithNoWorkerIsSafeAndRepeatable() {
+        RocksMcCommand.shutdown();
+        RocksMcCommand.shutdown();
+        assertTrue(true, "reached without throwing or hanging");
+    }
+
     private static net.minecraft.nbt.NbtCompound tag(String marker) {
         net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
         nbt.putString("marker", marker);

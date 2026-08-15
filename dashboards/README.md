@@ -24,7 +24,7 @@ dimension of a world, so a value's scope is not always "a dimension":
 | Scope | Labels | What it covers |
 |---|---|---|
 | **Store** | `dimension`, `store`, `database` | The mod's own IO counters — reads, writes, bytes, failures. Genuinely per dimension |
-| **Column family** (`_by_cf`) | `column_family`, `database` | SST bytes, key estimates, memtables, compaction backlog. **All dimensions share a column family**, so RocksDB cannot attribute these to one |
+| **Column family** (`_by_cf`) | `column_family`, `database` | SST bytes, blob bytes, key estimates, memtables, compaction backlog. **All dimensions share a column family**, so RocksDB cannot attribute these to one |
 | **Database** | `database` | Blob bytes, block cache, throttling, write stops. One write path per world |
 
 ⚠️ Column-family metrics carry a **`_by_cf`** suffix. Before consolidation these
@@ -88,6 +88,11 @@ max(rocksmc_databases) > 1
 ```
 
 ## Reading the numbers
+
+**`rocksmc_blob_file_bytes` also exists per column family** as
+`rocksmc_blob_file_bytes_by_cf`. Both come from RocksDB's own
+`live-blob-file-size` counter and the database-wide one is the sum of the
+per-column-family ones, so either is safe to aggregate — just not both together.
 
 **Blob files hold nearly all the bytes.** Key-value separation is enabled, so SST
 files contain only keys and blob pointers and will look tiny next to blob files —

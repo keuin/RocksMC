@@ -218,6 +218,11 @@ public final class RocksMc implements DedicatedServerModInitializer {
         // Before the exporter, so a checkpoint in flight is not abandoned mid-write by
         // a JVM that has already torn down its telemetry.
         CheckpointScheduler.stop();
+        // First, and waited for: an operation in flight holds the native handle, and
+        // vanilla's own shutdown hook may close it concurrently. See
+        // RocksMcCommand.shutdown for why that is a dangling pointer rather than an
+        // exception.
+        RocksMcCommand.shutdown();
         if (statsLogger != null) {
             statsLogger.shutdownNow();
         }

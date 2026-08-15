@@ -228,6 +228,12 @@ public final class MetricsExporter implements AutoCloseable {
                 cf -> cf.estimatedKeys));
             out.add(cfGauge("rocksmc_memtable_bytes_by_cf", "Memory held by memtables",
                 databases, cf -> cf.memtableBytes));
+            // Per column family now that RocksDB's own property supplies it. It was
+            // database-wide only because it used to be measured by scanning the
+            // directory, where blob filenames carry no column family.
+            out.add(cfGauge("rocksmc_blob_file_bytes_by_cf",
+                "Blob file bytes, where nearly all chunk bytes live", databases,
+                cf -> cf.blobFileBytes));
 
             // Compaction backlog is the leading indicator of trouble on a technical
             // server: it rises long before writes actually stall.

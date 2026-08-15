@@ -315,7 +315,7 @@ dimension:
 | Scope | Labels | Examples |
 |---|---|---|
 | Store | `dimension`, `store` (`region`/`poi`), `database` | chunk reads/writes, bytes, failures |
-| Column family | `column_family` (`chunk`/`poi`), `database` | SST bytes, key estimates, memtables, compaction backlog — all dimensions share a column family, so these **cannot** be split per dimension |
+| Column family | `column_family` (`chunk`/`poi`), `database` | SST bytes, **blob bytes**, key estimates, memtables, compaction backlog — all dimensions share a column family, so these **cannot** be split per dimension |
 | Database | `database` | blob bytes, block cache, throttling, write stops — one write path per world |
 
 ⚠️ The column-family metrics are suffixed **`_by_cf`** (e.g.

@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Operator commands under {@code /rocksmc}.
@@ -176,10 +177,22 @@ public final class RocksMcCommand {
             for (File checkpoint : checkpoints) {
                 boolean automatic = checkpoint.getName()
                     .startsWith(CheckpointScheduler.AUTOMATIC_PREFIX);
-                source.sendFeedback(text(String.format(Locale.ROOT, "  %-28s %8s %s",
+                // A shallow listing, not a recursive stat walk. Summing bytes means a
+                // stat of every file in every checkpoint, on the server thread:
+                // harmless at the default retention of six, but retention is tunable
+                // to 10,000, manual checkpoints are never pruned, and the file count
+                // grows with world size -- so it scales into tens of thousands of
+                // syscalls on the tick loop, in a diagnostic an operator reaches for
+                // during an incident.
+                //
+                // No real information is lost. The files are hard links, so a
+                // checkpoint's apparent size is roughly the live database's and says
+                // nothing about the space it actually pins.
+                String[] entries = checkpoint.list();
+                source.sendFeedback(text(String.format(Locale.ROOT,
+                    "  %-28s %5s files %s",
                     checkpoint.getName(),
-                    CheckpointScheduler.formatBytes(
-                        CheckpointScheduler.directoryBytes(checkpoint)),
+                    entries == null ? "?" : String.valueOf(entries.length),
                     automatic ? "(automatic, subject to retention)" : "(manual, kept)")),
                     false);
             }
@@ -189,6 +202,58 @@ public final class RocksMcCommand {
                 + "bad deploys, NOT against losing the drive"), false);
         }
         return 1;
+    }
+
+    /** How long shutdown waits for an in-flight maintenance operation. */
+    private static final int SHUTDOWN_WAIT_SECONDS = 30;
+
+    /**
+     * Stops the background worker, waiting for an operation in flight.
+     *
+     * <p>Called from the mod's shutdown hook, and it has to be. JVM shutdown hooks run
+     * <em>concurrently</em> with no ordering guarantee, so vanilla's hook can complete
+     * its world save -- releasing the last reference and closing the native handle --
+     * while a {@code /rocksmc compact} issued moments earlier is still running here.
+     * RocksDB's Java API does not guard against that: {@code compactRange},
+     * {@code flush} and {@code getLongProperty} pass the raw native handle straight to
+     * JNI without checking {@code isOwningHandle()}, so the result is a dangling
+     * pointer rather than an exception -- a JVM crash during shutdown, or a write
+     * against freed memory, non-deterministic and very hard to attribute.
+     *
+     * <p>A bounded wait rather than an indefinite one: a compaction of a large database
+     * genuinely takes a while, but a shutdown that never finishes is worse than one
+     * that gives up. On timeout it says so, and {@code RocksDatabase}'s own closed
+     * check is the second line of defence.
+     */
+    static void shutdown() {
+        ExecutorService pending;
+        String inFlight;
+        synchronized (LOCK) {
+            pending = worker;
+            inFlight = running;
+            worker = null;
+        }
+        if (pending == null) {
+            return;
+        }
+        if (inFlight != null) {
+            RocksMc.logger().info("rocksmc: waiting for {} to finish before shutdown",
+                inFlight);
+        }
+        pending.shutdown();
+        try {
+            if (!pending.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                RocksMc.logger().warn("rocksmc: {} did not finish within {}s; "
+                    + "abandoning it. The database refuses further operations from it "
+                    + "rather than touching a released handle.",
+                    inFlight == null ? "a maintenance operation" : inFlight,
+                    SHUTDOWN_WAIT_SECONDS);
+                pending.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            pending.shutdownNow();
+        }
     }
 
     // ------------------------------------------------------------------ inline

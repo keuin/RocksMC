@@ -261,6 +261,97 @@ class RocksDatabaseTest {
         assertThrows(IllegalStateException.class, database::release);
     }
 
+    /**
+     * Every native-touching operation must refuse a released handle.
+     *
+     * <p>This is the last line of defence against a use-after-free, and it is reachable:
+     * JVM shutdown hooks run concurrently, so a maintenance command, a metrics scrape or
+     * the stats logger can still be inside one of these while vanilla's hook closes the
+     * database. RocksDB's Java API does not help -- {@code compactRange}, {@code flush},
+     * {@code flushWal} and {@code getLongProperty} all pass the raw native handle to JNI
+     * without checking {@code isOwningHandle()}, so without this guard the result is a
+     * dangling pointer and a JVM crash, not an exception.
+     */
+    @Test
+    void operationsRefuseAClosedHandle(@TempDir Path tmp) throws Exception {
+        RocksChunkStore store = open(tmp, "region");
+        RocksDatabase database = store.database();
+        store.close();
+        assertTrue(database.isClosed());
+
+        assertThrows(IllegalStateException.class, database::syncWal,
+            "syncWal must not touch a released handle");
+        assertThrows(IllegalStateException.class, database::flushMemtables,
+            "flushMemtables must not touch a released handle");
+        assertThrows(IllegalStateException.class, database::compact,
+            "compact must not touch a released handle");
+        assertThrows(IllegalStateException.class,
+            () -> database.checkpoint(new File(tmp.toFile(), "cp-after-close")),
+            "checkpoint must not touch a released handle");
+    }
+
+    /**
+     * Property reads degrade instead of throwing, because they are the metrics path.
+     *
+     * <p>A scrape racing shutdown should lose a series, not fail the whole response.
+     * {@code -1} is the sentinel the exporter already drops, so this keeps the existing
+     * contract rather than inventing a second one.
+     */
+    @Test
+    void propertyReadsReturnTheSentinelWhenClosed(@TempDir Path tmp) throws Exception {
+        RocksChunkStore store = open(tmp, "region");
+        RocksDatabase database = store.database();
+        store.close();
+
+        assertEquals(-1L, database.longProperty("rocksdb.num-running-compactions"));
+        assertEquals(-1L, database.longProperty(RocksDatabase.CHUNK_CF,
+            "rocksdb.live-sst-files-size"));
+        assertEquals(-1L, database.blobFileBytes(),
+            "blob bytes are derived from properties, so they degrade the same way");
+    }
+
+    /**
+     * Blob bytes come from RocksDB's own counter, summed across column families.
+     *
+     * <p>Queried on the default column family the property returns 0, so it has to be
+     * summed rather than asked once -- a mistake that would silently under-report the
+     * bulk of the database's size, since blob files hold nearly all chunk bytes.
+     */
+    @Test
+    void blobBytesSumAcrossColumnFamilies(@TempDir Path tmp) throws Exception {
+        try (RocksChunkStore region = open(tmp, "region");
+             RocksChunkStore poi = open(tmp, "poi")) {
+            // Values large enough to exceed the 1024-byte min-blob-size and land in
+            // blob files rather than the LSM.
+            for (int i = 0; i < 8; i++) {
+                region.write(new ChunkPos(i, 0), bigNbt("region-" + i));
+                poi.write(new ChunkPos(i, 0), bigNbt("poi-" + i));
+            }
+            RocksDatabase database = region.database();
+            database.flushMemtables();
+
+            long chunkBlobs = database.longProperty(RocksDatabase.CHUNK_CF,
+                "rocksdb.live-blob-file-size");
+            long poiBlobs = database.longProperty(RocksDatabase.POI_CF,
+                "rocksdb.live-blob-file-size");
+            assertTrue(chunkBlobs > 0, "expected blob files for the chunk CF");
+            assertEquals(chunkBlobs + poiBlobs, database.blobFileBytes(),
+                "blobFileBytes must sum every data column family");
+
+            assertEquals(0L, database.longProperty("rocksdb.live-blob-file-size"),
+                "the property is per-column-family; asking once returns 0, which is "
+                    + "exactly why it must be summed");
+        }
+    }
+
+    /** NBT large enough that its value goes to a blob file rather than the LSM. */
+    private static NbtCompound bigNbt(String marker) {
+        NbtCompound tag = new NbtCompound();
+        tag.putString("marker", marker);
+        tag.putByteArray("payload", new byte[8192]);
+        return tag;
+    }
+
     /** Reopening after the last close must produce a working database again. */
     @Test
     void databaseCanBeReopenedAfterFullRelease(@TempDir Path tmp) throws Exception {
