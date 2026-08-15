@@ -119,8 +119,13 @@ public final class CheckpointScheduler {
      * {@code scheduleAtFixedRate} task cancels the schedule permanently and silently:
      * checkpoints would simply stop, with no further log line to say so. {@code Error}
      * is included for the same reason.
+     *
+     * <p>Package-private rather than private so a test can drive one pass directly.
+     * Waiting on the real timer would make the test slow and flaky, and testing
+     * {@code create} instead would prove nothing about this method -- the reporting that
+     * matters lives in the catch below, not in the operation that throws.
      */
-    private static void runScheduled(RocksMcConfig config) {
+    static void runScheduled(RocksMcConfig config) {
         try {
             for (RocksDatabase database : StoreRegistry.databases()) {
                 try {
@@ -133,6 +138,18 @@ public final class CheckpointScheduler {
                     RocksMc.logger().error("rocksmc: automatic checkpoint of {} failed. "
                         + "Rollback protection is NOT in place for this interval.",
                         database.name(), e);
+                    // Told to the operators, not only the log. This is the one failure
+                    // whose whole purpose is to be noticed before it is needed: nothing
+                    // else in the server behaves differently when a checkpoint is
+                    // missing, so a silent failure is discovered at the moment someone
+                    // reaches for a rollback that was never taken. FailureReporter's
+                    // throttle is right here -- a broken checkpoint will fail again next
+                    // interval, and repeating it every few minutes would train people to
+                    // ignore it.
+                    FailureReporter.report(FailureReporter.Kind.CHECKPOINT_FAILURE,
+                        "automatic checkpoint of " + database.name() + " failed ("
+                            + e.getClass().getSimpleName()
+                            + "); rollback protection is NOT in place");
                 }
             }
         } catch (Throwable t) {

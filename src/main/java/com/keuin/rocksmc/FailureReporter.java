@@ -147,16 +147,37 @@ public final class FailureReporter {
      * player list or the network handler off-thread is not safe.
      */
     private static void broadcast(Kind kind, String message) {
-        MinecraftServer server = SERVER.get();
-        if (server == null) {
-            return;
-        }
         // A legacy section-code prefix rather than Formatting.RED, because javac
         // cannot read net.minecraft.util.Formatting from the remapped 1.16.5 jar:
         // its enum constructor carries a malformed
         // RuntimeInvisibleParameterAnnotations attribute and compilation fails with
         // "bad class file". The code renders identically and costs no dependency.
-        Text text = new LiteralText("\u00a7c[rocksmc] " + kind + ": " + message);
+        broadcastToOperators("\u00a7c[rocksmc] " + kind + ": " + message);
+    }
+
+    /**
+     * Sends a fully-formed message to every online operator.
+     *
+     * <p>Lives here rather than in a class of its own because this is where the server
+     * reference is held, and because getting this right is fiddlier than it looks: the
+     * caller is usually a background thread, so the send has to be marshalled onto the
+     * server thread, and a failure to deliver a message must never propagate into
+     * whatever was being reported. Two callers needing that is not a reason to have two
+     * copies of it.
+     *
+     * <p>Takes a String rather than a {@code ServerCommandSource}, deliberately.
+     * Holding a source across a long operation is unsafe in two separate ways: a
+     * player's source pins the {@code ServerPlayerEntity} and keeps it reachable after
+     * they disconnect, and an RCON source writes into a buffer the dedicated server
+     * <em>shares between commands</em> and clears at the start of each one -- so a late
+     * write can land inside an unrelated command's response.
+     */
+    static void broadcastToOperators(String message) {
+        MinecraftServer server = SERVER.get();
+        if (server == null) {
+            return;
+        }
+        Text text = new LiteralText(message);
         server.execute(() -> {
             try {
                 for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
@@ -170,7 +191,7 @@ public final class FailureReporter {
                     }
                 }
             } catch (Throwable t) {
-                RocksMc.logger().warn("rocksmc: could not broadcast a storage alert", t);
+                RocksMc.logger().warn("rocksmc: could not broadcast to operators", t);
             }
         });
     }

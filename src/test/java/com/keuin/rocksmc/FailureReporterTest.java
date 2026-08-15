@@ -3,6 +3,7 @@ package com.keuin.rocksmc;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -121,5 +122,49 @@ class FailureReporterTest {
         assertEquals(threads - 1,
             FailureReporter.suppressedCount(FailureReporter.Kind.SYNC_FAILURE),
             "exactly one thread should have reported; the rest counted as suppressed");
+    }
+
+    /**
+     * Broadcasting must not throw when no server is attached.
+     *
+     * <p>Which is the state during an import, an export, and every unit test. A
+     * reporting path that only works on a running server is a reporting path that fails
+     * exactly when something is already going wrong.
+     */
+    @Test
+    void broadcastingWithoutAServerIsSilentRatherThanFatal() {
+        FailureReporter.broadcastToOperators("\u00a7a[rocksmc] compact finished");
+        FailureReporter.broadcastToOperators("");
+        // Reaching here without an exception is the assertion.
+    }
+
+    /**
+     * Every operator-facing message must be routed through this one method.
+     *
+     * <p>A mechanical check rather than a matter of care, because the failure mode of
+     * hand-rolling the broadcast elsewhere is silent: the loop would work on a test
+     * server and then deliver from a background thread on a real one, where touching the
+     * player list off the server thread is a data race. That is the sort of bug that
+     * shows up as an unreproducible crash months later.
+     */
+    @Test
+    void nothingElseIteratesThePlayerListToReachOperators() throws Exception {
+        java.io.File sources = new java.io.File("src/main/java/com/keuin/rocksmc");
+        java.io.File[] files = sources.listFiles((d, n) -> n.endsWith(".java"));
+        assertTrue(files != null && files.length > 0, "no sources found at " + sources);
+        List<String> offenders = new java.util.ArrayList<>();
+        for (java.io.File file : files) {
+            if (file.getName().equals("FailureReporter.java")) {
+                continue;
+            }
+            String body = new String(java.nio.file.Files.readAllBytes(file.toPath()),
+                java.nio.charset.StandardCharsets.UTF_8);
+            if (body.contains("getPlayerList()")) {
+                offenders.add(file.getName());
+            }
+        }
+        assertEquals(java.util.Collections.emptyList(), offenders,
+            "these reach operators without FailureReporter.broadcastToOperators, so they "
+                + "bypass its marshalling onto the server thread");
     }
 }

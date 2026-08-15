@@ -360,10 +360,20 @@ public final class RocksMcCommand {
      * Runs {@code task} against every open database off the server thread.
      *
      * <p>Refuses if another operation is already running rather than queueing, so a
-     * repeated command cannot stack work. Reports to the console rather than the
-     * original source: by the time a compaction finishes the player may have
-     * disconnected, and {@code ServerCommandSource} is not safe to use from another
-     * thread.
+     * repeated command cannot stack work.
+     *
+     * <p>Progress goes to the log and to every online operator, so whoever ran the
+     * command sees the result without tailing a file. What it does <em>not</em> do is
+     * keep the {@link ServerCommandSource} and write to that later, which is the
+     * obvious implementation and is wrong twice over. A player's source holds the
+     * {@code ServerPlayerEntity}, so keeping it across a compaction keeps a
+     * disconnected player reachable; and an RCON source writes into a buffer that
+     * {@code MinecraftDedicatedServer} <em>shares between commands</em> and clears at
+     * the start of each one, so a late write can be spliced into the response of an
+     * unrelated command -- which a monitoring script polling {@code /rocksmc stats}
+     * would hit. The invoker's name is captured instead, which is a String and
+     * therefore safe to hold, and the operator broadcast reaches them anyway: running
+     * these commands already requires operator level.
      */
     private static int background(ServerCommandSource source, String name,
             DatabaseTask task) {
@@ -388,30 +398,43 @@ public final class RocksMcCommand {
                     return t;
                 });
             }
-            worker.submit(() -> runTask(name, task, databases));
+            // getName(), not the source: a String survives the invoker disconnecting
+            // and cannot be written to. See this method's note.
+            String invoker = source.getName();
+            worker.submit(() -> runTask(name, invoker, task, databases));
         }
 
         source.sendFeedback(text("rocksmc: " + name + " started in the background; "
-            + "progress goes to the server log."), true);
+            + "progress will be reported to operators and the server log."), true);
         return 1;
     }
 
-    private static void runTask(String name, DatabaseTask task,
+    private static void runTask(String name, String invoker, DatabaseTask task,
             List<RocksDatabase> databases) {
         try {
             for (RocksDatabase database : databases) {
                 long start = System.nanoTime();
                 try {
                     String summary = task.run(database);
+                    long elapsed = (System.nanoTime() - start) / 1_000_000L;
                     RocksMc.logger().info("rocksmc: {} on {} finished in {} ms -- {}",
-                        name, database.name(),
-                        (System.nanoTime() - start) / 1_000_000L, summary);
+                        name, database.name(), elapsed, summary);
+                    // Green, so a completion is distinguishable at a glance from the
+                    // red a FailureReporter alert uses.
+                    announce("\u00a7a", name, invoker, database.name(),
+                        "finished in " + elapsed + " ms -- " + summary);
                 } catch (IOException | RuntimeException e) {
                     // Logged, never rethrown: this runs on a background thread whose
                     // uncaught exception would be invisible, and a failed maintenance
                     // operation must not look like success.
                     RocksMc.logger().error("rocksmc: {} on {} FAILED",
                         name, database.name(), e);
+                    // Broadcast directly rather than through FailureReporter, which
+                    // throttles by kind: an operator who just asked for this work is
+                    // owed the answer even if an unrelated alert of the same kind fired
+                    // moments ago.
+                    announce("\u00a7c", name, invoker, database.name(),
+                        "FAILED: " + describe(e) + " -- see the server log");
                 }
             }
         } finally {
@@ -419,6 +442,26 @@ public final class RocksMcCommand {
                 running = null;
             }
         }
+    }
+
+    /**
+     * Tells the operators what a background operation did.
+     *
+     * <p>Names the invoker, because otherwise an operator watching a compaction land
+     * mid-session has no way to tell whether a colleague asked for it or the mod decided
+     * on its own.
+     */
+    private static void announce(String colour, String name, String invoker,
+            String database, String outcome) {
+        FailureReporter.broadcastToOperators(colour + "[rocksmc] " + name
+            + " (by " + invoker + ") on " + database + ": " + outcome);
+    }
+
+    /** A short cause for chat; the stack trace stays in the log where it belongs. */
+    private static String describe(Throwable error) {
+        String message = error.getMessage();
+        return error.getClass().getSimpleName()
+            + (message == null || message.isEmpty() ? "" : ": " + message);
     }
 
     /**

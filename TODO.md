@@ -9,7 +9,7 @@ as well as the steps.
 
 Everything below the next divider is history. Current state:
 
-**211 tests pass, `./gradlew build` clean.** Deployed and working on
+**214 tests pass, `./gradlew build` clean.** Deployed and working on
 the beta mirror at `/opt/onesmp/mirror_rocksmc` (real 293,207-chunk world; POI verified
 live by the operator). 8 commits ahead of `origin/master`, not pushed.
 
@@ -78,6 +78,15 @@ good data on logout, so returning null from a DB hook is data loss, not a no-op.
 - **Self-verification is not verification.** The exporter reading back what it just wrote
   cannot catch a fault shared by the write and the read. `compareWorlds` exists for that,
   and was itself checked by flipping one byte and confirming it objected.
+- **Check a new test fails without the fix.** Two tests written this session passed
+  against deliberately broken code: one asserted "nothing was suppressed", which is
+  equally true of an alert that never fired. Assert something only the working code can
+  produce.
+- **Never hold a `ServerCommandSource` past the command.** A player's source pins their
+  entity; an RCON source writes into a buffer the dedicated server shares between
+  commands and clears per command, so a late write lands in an unrelated response.
+  Capture `getName()` and reply through the operator broadcast.
+- `pgrep -f <pattern>` matches the shell running the `pgrep`. Use `[p]attern`.
 
 ---
 ---

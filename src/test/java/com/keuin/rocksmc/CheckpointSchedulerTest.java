@@ -397,4 +397,47 @@ class CheckpointSchedulerTest {
             Files.copy(from.toPath(), to.toPath());
         }
     }
+
+    /**
+     * A failed automatic checkpoint must reach the operators, not only the log.
+     *
+     * <p>This is the one failure whose entire purpose is to be noticed before it
+     * matters. Nothing about the running server behaves differently when a checkpoint is
+     * missing, so a silent failure is discovered at the moment somebody reaches for a
+     * rollback that was never taken. The alert kind existed for this from the start and
+     * was never raised by anything.
+     *
+     * <p>Asserts through the throttle counter, having first written the obvious version
+     * of this test and found it passed with the alert deleted: with no server attached
+     * there is nothing to observe a delivery directly, and "nothing was suppressed" is
+     * equally true of a report that never happened. Two failures are distinguishable,
+     * because the second can only be counted as suppressed if the first was recorded.
+     */
+    @Test
+    void aFailedAutomaticCheckpointAlertsTheOperators(@TempDir Path tmp)
+            throws Exception {
+        FailureReporter.resetForTesting();
+        RocksChunkStore store = RocksChunkStore.open(
+            DimensionKey.fromStorageDirectory(new File(tmp.toFile(), "region")),
+            config());
+        try {
+            // A file where the checkpoint directory has to go, so creation fails for a
+            // reason unrelated to the health of the database itself.
+            assertTrue(new File(tmp.toFile(), "rocksmc-checkpoints").createNewFile());
+
+            CheckpointScheduler.runScheduled(config());
+            assertEquals(0L, FailureReporter.suppressedCount(
+                FailureReporter.Kind.CHECKPOINT_FAILURE),
+                "the first failure must be delivered, not throttled");
+
+            CheckpointScheduler.runScheduled(config());
+            assertEquals(1L, FailureReporter.suppressedCount(
+                FailureReporter.Kind.CHECKPOINT_FAILURE),
+                "the second failure proves the first was actually reported; if nothing "
+                    + "reported, nothing could be suppressed");
+        } finally {
+            store.close();
+            FailureReporter.resetForTesting();
+        }
+    }
 }

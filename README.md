@@ -380,10 +380,24 @@ Registration is confirmed in the log (`rocksmc: registered /rocksmc (6 subcomman
 on boot and again after each `/reload`.
 
 All require permission level 3. `flush`, `compact` and `checkpoint` run on a
-background thread and report to the server log when they finish, because a compaction
-of a real 1.1 GB database is not instant and running it on the server thread would
-stall every player. Only one runs at a time; a second request is refused rather than
-queued.
+background thread, because a compaction of a real 1.1 GB database is not instant and
+running it on the server thread would stall every player. Only one runs at a time; a
+second request is refused rather than queued.
+
+When they finish they report to the log **and to every online operator in chat**, so
+whoever asked does not have to tail a file to find out. The message names the invoker,
+since otherwise an operator watching a compaction land mid-session cannot tell whether
+a colleague asked for it or the mod decided on its own.
+
+The reply is sent to the operators rather than back down the channel the command came
+from, which is deliberate. Keeping the `ServerCommandSource` and writing to it later
+would be wrong twice: a player's source holds their entity, so it stays reachable after
+they disconnect, and an RCON source writes into a buffer that the dedicated server
+*shares between commands* and clears at the start of each one — a late write can be
+spliced into the response of an unrelated command, which a monitoring script polling
+`/rocksmc stats` would hit. An RCON caller therefore gets the "started" acknowledgement
+and finds the outcome in the log; its response has already been sent by the time the
+work finishes, so there is nowhere else for it to go.
 
 Checkpoints can also run on a timer: set `checkpoint-interval-minutes` and
 `checkpoint-keep`. Retention only deletes automatic (`auto-`) names, never one you
