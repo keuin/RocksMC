@@ -253,44 +253,19 @@ public final class RocksChunkStore implements ChunkStore {
     }
 
     /**
-     * Key layout: {@code dimension(4B) | morton(x,z)(8B)}, big-endian.
+     * The key for a chunk in this store's dimension.
      *
-     * <p>Big-endian keeps RocksDB's lexicographic byte ordering consistent with
-     * numeric ordering, and Morton interleaving preserves spatial locality.
+     * <p>Delegates to {@link ChunkKeyCodec}, which also owns the inverse. Two copies of
+     * this encoding that could disagree is exactly the kind of drift that places
+     * terrain at the wrong coordinates while round-tripping cleanly.
      */
     static byte[] key(int dimensionId, ChunkPos pos) {
-        long morton = morton(pos.x, pos.z);
-        byte[] k = new byte[12];
-        k[0] = (byte) (dimensionId >>> 24);
-        k[1] = (byte) (dimensionId >>> 16);
-        k[2] = (byte) (dimensionId >>> 8);
-        k[3] = (byte) dimensionId;
-        for (int i = 0; i < 8; i++) {
-            k[4 + i] = (byte) (morton >>> (8 * (7 - i)));
-        }
-        return k;
+        return ChunkKeyCodec.key(dimensionId, pos);
     }
 
-    /**
-     * Interleaves the low 32 bits of x and z into a 64-bit Morton (Z-order) code.
-     *
-     * <p>Coordinates are biased by {@link Integer#MIN_VALUE} first so that
-     * negative chunk coordinates -- which are entirely normal in Minecraft -- sort
-     * before positive ones under unsigned byte comparison.
-     */
+    /** Visible for tests: the Morton interleave behind the key. */
     static long morton(int x, int z) {
-        return (spread(x ^ Integer.MIN_VALUE) << 1) | spread(z ^ Integer.MIN_VALUE);
-    }
-
-    /** Spreads the 32 bits of {@code v} into the even bit positions of a long. */
-    private static long spread(int v) {
-        long r = v & 0xFFFFFFFFL;
-        r = (r | (r << 16)) & 0x0000FFFF0000FFFFL;
-        r = (r | (r << 8)) & 0x00FF00FF00FF00FFL;
-        r = (r | (r << 4)) & 0x0F0F0F0F0F0F0F0FL;
-        r = (r | (r << 2)) & 0x3333333333333333L;
-        r = (r | (r << 1)) & 0x5555555555555555L;
-        return r;
+        return ChunkKeyCodec.morton(x, z);
     }
 
     public String statsSummary() {
