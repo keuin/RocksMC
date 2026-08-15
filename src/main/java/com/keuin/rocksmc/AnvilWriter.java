@@ -84,8 +84,16 @@ public final class AnvilWriter implements AutoCloseable {
      */
     public AnvilWriter(File path, File directory) throws IOException {
         this.path = path;
-        if (!directory.isDirectory() && !directory.mkdirs()) {
-            throw new IOException("could not create " + directory);
+        // Files.createDirectories rather than mkdirs, because the export runs one
+        // worker per region and they share a dimension's directory. mkdirs() returns
+        // false when another thread has just created it, and testing isDirectory()
+        // first does not help -- both threads can see it missing and then one loses the
+        // race. createDirectories is specified to succeed if the directory already
+        // exists, so the race has no losers.
+        try {
+            java.nio.file.Files.createDirectories(directory.toPath());
+        } catch (java.io.IOException e) {
+            throw new IOException("could not create " + directory, e);
         }
         // dsync=false: this is a bulk export, and close() forces the file to disk once
         // at the end. Passing true would fsync on every chunk, which measured a 3.65x
@@ -124,6 +132,21 @@ public final class AnvilWriter implements AutoCloseable {
             NbtIo.write(nbt, out);
         }
         return buffer.toByteArray();
+    }
+
+    /**
+     * Parses what {@link #serialise} produced: the exact counterpart, so the two stay
+     * together if the storage encoding ever changes.
+     *
+     * <p>Uncompressed, because that is how chunk values are held in the database --
+     * RocksDB compresses whole blocks itself, and compressing each value first would
+     * only make its work harder.
+     */
+    public static NbtCompound parse(byte[] nbtBytes) throws IOException {
+        try (java.io.DataInputStream in = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(nbtBytes))) {
+            return NbtIo.read(in);
+        }
     }
 
     /**

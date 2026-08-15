@@ -269,10 +269,10 @@ and a strict parity mode is retained.
       a single recovery point across all dimensions
 - [x] **Phase 4** — checkpoint-based recoverable snapshots, manual and scheduled,
       with retention; restore verified to recover all 293,207 entries
-- [ ] **Phase 5** — `.mca` export (**in progress**: key codec and writer done and
-      tested; exporter drafted, not yet wired up or verified). Import already exists,
-      so this completes the round trip and turns the `.mca` files from a permanent
-      rollback tax into something regenerable on demand
+- [x] **Phase 5** — `.mca` export, completing the round trip: `exportWorld`
+      regenerates a vanilla world from the database, verified `IDENTICAL` against the
+      original 293,207 chunks by an independent comparison (`compareWorlds`). The
+      `.mca` files are no longer a permanent rollback tax
 - [ ] **Phase 3** — `playerdata` + `state`
 
 **Beta-capable, not production-ready.** See
@@ -310,6 +310,42 @@ Everything goes into **one database per world**, `<world>/rocksmc.db`, with chun
 and POI data in separate column families. Every dimension is converted in a single
 pass — importing only some of them and then starting a server would let the rest
 regenerate silently.
+
+## Exporting back to `.mca`
+
+```bash
+./gradlew exportWorld -Pworld=/path/to/world -Pout=/path/to/output
+```
+
+The reverse, and what stops the database being a one-way door: BlueMap, Dynmap,
+Amulet, Chunker and every pregenerator read `.mca` and nothing else.
+
+The database is opened **read-only** and read through a single snapshot, so the
+source cannot be modified and every dimension is read at one instant. For a
+**running** server, take a checkpoint first and export that — a live database has
+writes still sitting in memtables:
+
+```bash
+# in game, or over RCON
+/rocksmc checkpoint nightly
+./gradlew exportWorld -Pdatabase=<world>/rocksmc-checkpoints/nightly -Pout=/tmp/w
+```
+
+Each region is read back and compared after writing. That check cannot catch a
+fault shared by the write and the read, though, so to compare an export against
+the original world independently:
+
+```bash
+./gradlew compareWorlds -Pa=/path/to/original -Pb=/path/to/exported
+```
+
+This compares parsed NBT rather than bytes, because region files legitimately
+differ byte-for-byte while holding identical chunks — sector allocation follows
+write order and timestamps are wall clock.
+
+Measured on a 293,207-chunk world: export 28 s, comparison 27 s on 24 threads,
+`IDENTICAL`. Note that `level.dat`, `playerdata/`, `data/` and `advancements/` are
+not in the database and are not exported; copy them across for a loadable world.
 
 Measured on a real 293,207-chunk world: **31.6 s** on 24 cores, all chunks
 verified, resulting database **33.9% smaller on disk** than the `.mca` files.

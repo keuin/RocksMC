@@ -31,7 +31,7 @@ Known gaps — none block a beta, all matter operationally:
 |---|---|
 | **Chunk and POI are not atomic with respect to each other** | One database means one write-ahead log and therefore one *recovery point*, which is what the crash test verifies. It does **not** batch a chunk write together with its POI write: those originate in independent `StorageIoWorker`s above the seam this mod injects at. A crash can still land between them |
 | **`playerdata`, `data/`, `level.dat` are still flat files** (Phase 3) | Backups must capture them *and* the database |
-| **No `.mca` interop yet** (Phase 5, in progress) | Amulet, Chunker, BlueMap/Dynmap and pregenerators cannot read the result. Until the exporter ships, keep the `.mca` files — they are the only route back |
+| **`.mca` interop is offline only** (Phase 5) | Amulet, Chunker, BlueMap/Dynmap and pregenerators cannot read the database directly. `exportWorld` regenerates a vanilla world from it — verified `IDENTICAL` on 293,207 chunks — but that is a batch job, not a live view, so a web map cannot follow the world as it changes |
 | Read path is slower than Anvil | Anvil resolves a chunk in one in-memory header hit plus one seek. That is O(1) and an LSM cannot beat it |
 
 ## 2. Host preparation
@@ -423,6 +423,31 @@ the import left off. Anything built during the beta lives only in `rocksmc.db`
 and is lost — which is the expected trade.
 
 Keep the `.mca` files for the whole beta. They are the rollback.
+
+### Reclaiming the `.mca` space
+
+The `.mca` files can now be regenerated, so they no longer have to be kept forever
+as the only route back. The sequence that licenses deleting them:
+
+```bash
+/rocksmc checkpoint before-delete                    # in game or over RCON
+./gradlew exportWorld -Pdatabase=<world>/rocksmc-checkpoints/before-delete \
+                      -Pout=/tmp/verify
+./gradlew compareWorlds -Pa=<world> -Pb=/tmp/verify   # must say IDENTICAL
+```
+
+Only after `IDENTICAL` is deleting `<world>/region`, `<world>/poi` and their
+per-dimension equivalents a reversible act rather than a bet. Verify against the
+world you are about to delete from, not against an older backup.
+
+⚠️ **Export what the database has, not what the disk has.** Exporting a live
+database silently omits anything still in a memtable, which is why the checkpoint
+comes first. Exporting a checkpoint is the supported route on a running server.
+
+⚠️ Do **not** delete `level.dat`, `playerdata/`, `data/`, `advancements/`,
+`stats/`, `datapacks/`, or the per-dimension `data/` directories. None of them are
+in the database, and none of them are exported. `data/` in particular holds the
+scoreboard, maps, `idcounts.dat`, forceload and command storage.
 
 ## 8. Pre-flight checklist
 

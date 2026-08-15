@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -323,5 +325,50 @@ class AnvilWriterTest {
             assertEquals(expected.get(pos), read.get(pos), "mismatch at " + pos);
         }
         assertEquals(0, region.length() % SECTOR);
+    }
+
+    /**
+     * Many writers can share a dimension directory that does not exist yet.
+     *
+     * <p>A regression test for a bug that every unit test missed and the first real
+     * export hit immediately: the constructor used {@code mkdirs()}, which returns false
+     * when another thread has just created the directory. Guarding it with
+     * {@code isDirectory()} does not fix it, because both threads can see the directory
+     * missing and then one loses the race. It surfaced only at 24 workers against a
+     * fresh output directory -- the small thread counts in these tests never collided.
+     */
+    @Test
+    void concurrentWritersCanShareANewDirectory(@TempDir Path tmp) throws Exception {
+        int workers = 24;
+        File directory = new File(tmp.toFile(), "region");
+        assertFalse(directory.exists(), "the directory must not exist yet");
+
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(workers);
+        List<Throwable> failures =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        for (int i = 0; i < workers; i++) {
+            int index = i;
+            Thread worker = new Thread(() -> {
+                try {
+                    start.await();
+                    File region = new File(directory, "r." + index + ".0.mca");
+                    try (AnvilWriter writer = new AnvilWriter(region, directory)) {
+                        writer.write(new ChunkPos(index * 32, 0), nbt("worker" + index, 4096));
+                    }
+                } catch (Throwable t) {
+                    failures.add(t);
+                } finally {
+                    done.countDown();
+                }
+            });
+            worker.setDaemon(true);
+            worker.start();
+        }
+
+        start.countDown();
+        assertTrue(done.await(60, TimeUnit.SECONDS), "writers did not finish");
+        assertTrue(failures.isEmpty(), "creating the shared directory raced: " + failures);
+        assertEquals(workers, directory.listFiles((d, n) -> n.endsWith(".mca")).length);
     }
 }

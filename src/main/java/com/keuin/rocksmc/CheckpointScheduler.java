@@ -157,8 +157,12 @@ public final class CheckpointScheduler {
             throw new IOException("checkpoint already exists: " + target
                 + " (choose another name, or delete it first)");
         }
-        if (!parent.isDirectory() && !parent.mkdirs()) {
-            throw new IOException("could not create " + parent);
+        // Idempotent, so a scheduled checkpoint and a manual one racing here cannot
+        // make the loser fail. See AnvilWriter for the same reasoning.
+        try {
+            java.nio.file.Files.createDirectories(parent.toPath());
+        } catch (IOException e) {
+            throw new IOException("could not create " + parent, e);
         }
 
         long start = System.nanoTime();

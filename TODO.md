@@ -9,39 +9,33 @@ as well as the steps.
 
 Everything below the next divider is history. Current state:
 
-**201 tests pass, `./gradlew build` clean, working tree clean.** Deployed and working on
+**211 tests pass, `./gradlew build` clean.** Deployed and working on
 the beta mirror at `/opt/onesmp/mirror_rocksmc` (real 293,207-chunk world; POI verified
 live by the operator). 8 commits ahead of `origin/master`, not pushed.
 
-### IN PROGRESS — Phase 5, the `.mca` exporter
+### DONE — Phase 5, the `.mca` exporter
 
-`ChunkKeyCodec` and `AnvilWriter` are done and tested. `WorldExporter` and `ExportMain`
-are committed as **WIP with no tests and never run** (`7e5868b`) — treat as a draft.
+`exportWorld` writes a vanilla world back out of the database; `compareWorlds` checks an
+export against the original independently. Verified on the real world: 293,207 chunks
+exported in 28 s and compared `IDENTICAL` in 27 s, 24 threads.
 
-Remaining, in order:
+Two defects only the real world exposed, both now regression-tested:
 
-1. `exportWorld` Gradle task, mirroring `importWorld` (`build.gradle`, ~30 lines).
-2. Tests. The one that matters most: **`.mca` → import → export → `AnvilReader`**, asserting
-   the `{ChunkPos → NBT}` maps are equal. Reuse `AnvilReaderTest.writeRegion` /
-   `WorldImporterTest.writeRegion` as fixtures, plus **one chunk big enough to force the
-   ≥256-sector spill** through the whole path. Also needed: a test pinning that
-   serialise→parse→serialise is byte-stable, since the exporter's hash-based
-   verification depends on it.
-3. Verify on the real world: extract `~/kbackup-2025-09-29_02-06-31_before-recovery-rollback.zip`
-   to `/tmp`, `importWorld`, then `exportWorld`, then compare exported `.mca` against the
-   originals chunk-for-chunk. Expect 293,207.
-4. Docs: README roadmap (Phase 5 currently unchecked at line ~273), `beta-setup.md`
-   (a `.mca` exporter changes the rollback story — the `.mca` files stop being a
-   permanent 1.69 GiB tax and become regenerable on demand).
+- `AnvilWriter` created its directory with `mkdirs()`, which returns false when another
+  worker just created it. Guarding with `isDirectory()` does not help -- both threads can
+  see it missing and one loses. `Files.createDirectories` is idempotent. Unit tests at 4
+  threads never collided; 24 threads against a fresh directory failed instantly. The same
+  bug was in `CheckpointScheduler` and is fixed there too.
+- `AnvilReader.Report.total()` counts empty region files as damage. They are not: vanilla
+  makes one as soon as anything asks about a region, and the real world holds 555. Added
+  `corruption()`, which excludes them, for code auditing a world it did not write.
 
-Design decisions already made and agreed, do not relitigate:
+Still open, small:
 
-- Reuse vanilla `RegionFile`; do **not** hand-roll a writer.
-- Standalone tool (no Fabric Loader → no mixin → vanilla's writer is stock bytecode).
-- **Read-only open + snapshot** by default. For a running server the supported route is
-  `/rocksmc checkpoint` then `--database <world>/rocksmc-checkpoints/<name>`; pointing at
-  a live database would miss unflushed memtables.
-- Verification by SHA-256 of serialised NBT, not by holding NBT (memory).
+- `entities/` is read by `compareWorlds` but is a 1.17+ directory, so it is dead code on
+  1.16.5. Harmless, and correct if this is ever ported forward.
+- No test drives `ExportMain`/`CompareMain` argument parsing; both are covered only by
+  having been run by hand.
 
 ### Then: Phase 3 — `playerdata` + saved data
 
@@ -78,6 +72,12 @@ good data on logout, so returning null from a DB hook is data loss, not a no-op.
   correct and the operator was right to reject the machinery.
 - A flaky test is worse than no test. `Thread.join(timeout)` returns whether or not the
   thread finished — use a latch.
+- **Unit tests do not reproduce production concurrency.** Both Phase 5 defects survived a
+  green suite and died within seconds of the real world: a `mkdirs()` race that needs ~24
+  threads to show, and a report category that needs a world nobody wrote by hand.
+- **Self-verification is not verification.** The exporter reading back what it just wrote
+  cannot catch a fault shared by the write and the read. `compareWorlds` exists for that,
+  and was itself checked by flipping one byte and confirming it objected.
 
 ---
 ---

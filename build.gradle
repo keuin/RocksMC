@@ -488,6 +488,108 @@ tasks.register('importWorld', JavaExec) {
 }
 
 // ---------------------------------------------------------------------------
+// exportWorld: write a RocksDB world back out as vanilla Anvil .mca files.
+//
+// The reverse of importWorld, and what makes the database non-final: BlueMap,
+// Dynmap, Amulet, Chunker and every pregenerator read .mca and nothing else.
+//
+// The database is opened READ-ONLY and read through a single snapshot, so the
+// source cannot be modified and every dimension is read at one instant.
+//
+// For a RUNNING server, take a checkpoint first and export that:
+//
+//   /rocksmc checkpoint nightly
+//   ./gradlew exportWorld -Pdatabase=<world>/rocksmc-checkpoints/nightly -Pout=/tmp/w
+//
+// Exporting a live database would miss anything still in a memtable.
+//
+//   ./gradlew exportWorld -Pworld=/path/to/world -Pout=/path/to/output
+//   ./gradlew exportWorld -Pdatabase=/path/to/checkpoint -Pout=... [-Poverwrite]
+//                         [-Pthreads=n]
+// ---------------------------------------------------------------------------
+tasks.register('exportWorld', JavaExec) {
+    group = 'rocksmc'
+    description = 'Export a RocksDB world back to Anvil .mca files.'
+    dependsOn 'classes'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.keuin.rocksmc.ExportMain'
+    // Peak heap scales with worker count, not world size: one region's chunks are
+    // held only long enough to write and verify them, then dropped.
+    maxHeapSize = '4G'
+
+    doFirst {
+        if (!project.hasProperty('world') && !project.hasProperty('database')) {
+            throw new GradleException("Specify the source:\n"
+                + "  ./gradlew exportWorld -Pworld=/path/to/world -Pout=/path/to/out\n"
+                + "or, for a running server, take a checkpoint and export that:\n"
+                + "  ./gradlew exportWorld -Pdatabase=<world>/rocksmc-checkpoints/<name>"
+                + " -Pout=/path/to/out")
+        }
+        if (project.hasProperty('world') && project.hasProperty('database')) {
+            throw new GradleException(
+                "Pass either -Pworld or -Pdatabase, not both.")
+        }
+        if (!project.hasProperty('out')) {
+            throw new GradleException(
+                "Specify the output directory: -Pout=/path/to/output")
+        }
+        def argv = []
+        if (project.hasProperty('world')) {
+            argv << '--world' << project.property('world').toString()
+        } else {
+            argv << '--database' << project.property('database').toString()
+        }
+        argv << '--out' << project.property('out').toString()
+        if (project.hasProperty('overwrite')) {
+            argv << '--overwrite'
+        }
+        if (project.hasProperty('threads')) {
+            argv << '--threads' << project.property('threads').toString()
+        }
+        args = argv
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compareWorlds: compare two Anvil world directories chunk for chunk.
+//
+// The export verifies itself by reading back what it wrote, which cannot catch a
+// fault shared by the write and the read. This answers the question that actually
+// licenses deleting a world's .mca files: does the export match the original?
+//
+// Compares parsed NBT, not bytes -- region files differ byte-for-byte while
+// holding identical chunks, because sector allocation follows write order and
+// timestamps are wall clock.
+//
+//   ./gradlew compareWorlds -Pa=/path/to/original -Pb=/path/to/exported
+// ---------------------------------------------------------------------------
+tasks.register('compareWorlds', JavaExec) {
+    group = 'verification'
+    description = 'Compare two Anvil world directories chunk for chunk.'
+    dependsOn 'classes'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.keuin.rocksmc.CompareMain'
+    // Holds two region files' chunks at once per worker, so roughly twice the
+    // export's footprint.
+    maxHeapSize = '8G'
+
+    doFirst {
+        if (!project.hasProperty('a') || !project.hasProperty('b')) {
+            throw new GradleException("Specify both worlds:\n"
+                + "  ./gradlew compareWorlds -Pa=/original -Pb=/exported")
+        }
+        def argv = ['--a', project.property('a').toString(),
+                    '--b', project.property('b').toString()]
+        if (project.hasProperty('threads')) {
+            argv << '--threads' << project.property('threads').toString()
+        }
+        args = argv
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fidelity: round-trip real .mca chunks through RocksDB and verify NBT equality.
 //
 // Runs outside the game against any world directory, including real server

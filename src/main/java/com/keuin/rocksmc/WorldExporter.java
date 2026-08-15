@@ -163,6 +163,17 @@ public final class WorldExporter {
     public static final class Result {
         public final List<DimensionResult> dimensions = new ArrayList<>();
 
+        /** Every dimension's failures, flattened and labelled with their dimension. */
+        public List<String> failures() {
+            List<String> all = new ArrayList<>();
+            for (DimensionResult d : this.dimensions) {
+                for (String failure : d.failures()) {
+                    all.add(d.label + ": " + failure);
+                }
+            }
+            return all;
+        }
+
         public int totalChunks() {
             int n = 0;
             for (DimensionResult d : this.dimensions) {
@@ -417,7 +428,9 @@ public final class WorldExporter {
     private static void verifyRegion(File regionFile,
             Map<ChunkPos, String> expected, DimensionResult out) throws IOException {
         AnvilReader.Report report = new AnvilReader.Report();
-        List<ChunkPos> seen = new ArrayList<>();
+        // A set, not a list: the completeness check below scans it once per expected
+        // chunk, and a region holds 1024 of them.
+        java.util.Set<ChunkPos> seen = new java.util.HashSet<>();
         AnvilReader.stream(regionFile, report, entry -> {
             String original = expected.get(entry.pos());
             seen.add(entry.pos());
