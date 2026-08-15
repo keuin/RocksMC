@@ -30,7 +30,7 @@ bites today or only later, and what fixing it would take.
 > and where code runs, which is exactly what other mods change. Deriving from the
 > directory depends on nothing but its own argument.
 >
-> 43 unit tests cover every layout, both storage leaves, the world root each
+> Unit tests cover every layout, both storage leaves, the world root each
 > yields, the substring misidentification the old code was prone to, and ordinal
 > stability across reopen. Real-world fidelity is unchanged at 293,207/293,207.
 >

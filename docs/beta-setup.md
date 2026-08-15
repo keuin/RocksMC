@@ -31,7 +31,7 @@ Known gaps — none block a beta, all matter operationally:
 |---|---|
 | **Chunk and POI are not atomic with respect to each other** | One database means one write-ahead log and therefore one *recovery point*, which is what the crash test verifies. It does **not** batch a chunk write together with its POI write: those originate in independent `StorageIoWorker`s above the seam this mod injects at. A crash can still land between them |
 | **`playerdata`, `data/`, `level.dat` are still flat files** (Phase 3) | Backups must capture them *and* the database |
-| **No `.mca` interop** (Phase 5) | Amulet, Chunker, BlueMap/Dynmap and pregenerators cannot read the result |
+| **No `.mca` interop yet** (Phase 5, in progress) | Amulet, Chunker, BlueMap/Dynmap and pregenerators cannot read the result. Until the exporter ships, keep the `.mca` files — they are the only route back |
 | Read path is slower than Anvil | Anvil resolves a chunk in one in-memory header hit plus one seek. That is O(1) and an LSM cannot beat it |
 
 ## 2. Host preparation

@@ -269,8 +269,11 @@ and a strict parity mode is retained.
       a single recovery point across all dimensions
 - [x] **Phase 4** — checkpoint-based recoverable snapshots, manual and scheduled,
       with retention; restore verified to recover all 293,207 entries
+- [ ] **Phase 5** — `.mca` export (**in progress**: key codec and writer done and
+      tested; exporter drafted, not yet wired up or verified). Import already exists,
+      so this completes the round trip and turns the `.mca` files from a permanent
+      rollback tax into something regenerable on demand
 - [ ] **Phase 3** — `playerdata` + `state`
-- [ ] **Phase 5** — bidirectional `.mca` ⇄ RocksDB converter
 
 **Beta-capable, not production-ready.** See
 [`docs/beta-setup.md`](docs/beta-setup.md) for deployment, and the untested areas

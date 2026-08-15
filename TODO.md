@@ -7,87 +7,79 @@ as well as the steps.
 
 ## ⏸ WHERE THINGS STAND (read this first)
 
-Everything below the next divider is history. The current state:
+Everything below the next divider is history. Current state:
 
-**Just landed** (see the two most recent commits): operator commands, six verified
-defects, scheduled checkpoints, and then a production bug fix plus three High-severity
-robustness findings. 174 tests pass; `./gradlew build` is clean.
+**201 tests pass, `./gradlew build` clean, working tree clean.** Deployed and working on
+the beta mirror at `/opt/onesmp/mirror_rocksmc` (real 293,207-chunk world; POI verified
+live by the operator). 8 commits ahead of `origin/master`, not pushed.
 
-**Deployed and working** on the beta mirror at `/opt/onesmp/mirror_rocksmc` — a real
-293,207-chunk world, POI verified live by the operator (villagers keep professions and
-beds across restarts).
+### IN PROGRESS — Phase 5, the `.mca` exporter
 
-### Next up, in order
+`ChunkKeyCodec` and `AnvilWriter` are done and tested. `WorldExporter` and `ExportMain`
+are committed as **WIP with no tests and never run** (`7e5868b`) — treat as a draft.
 
-1. **Phase 5 — `.mca` exporter.** Fully researched, not started. Scope ~1,200–1,750 LOC
-   with tests. Key findings from that research, so it need not be redone:
-   - **Reuse vanilla `RegionFile`** (`public`, non-final, public constructors) rather
-     than hand-rolling a writer. It already handles framing, the sector allocator, the
-     header rewrite, `.mcc` spill and end-of-file alignment.
-   - Run it as a **standalone tool** (a third `*Main` beside `ImportMain`/`FidelityMain`)
-     so no Fabric Loader means no mixin, and vanilla's writer is stock bytecode.
-   - `AnvilReader.stream` is the read-back verifier — an independent oracle already.
-   - **Morton keys group by region file for free**: for any region, its 1024 chunks are
-     1024 consecutive Morton codes aligned to a 1024 boundary
-     (`morton >> 10` identifies the region). So a single forward scan yields chunks
-     already grouped, one `RegionFile` open at a time, and per-region parallelism is a
-     computable key range. No sort, no seek-per-region.
-   - The Morton **inverse** exists only in `ChunkKeyTest` (`unspreadHigh`/`unspreadLow`/
-     `compact`); promote it beside `morton`/`spread` and have the test call it.
-   - Highest-severity risk if hand-rolling: `sectors >= 256` writes `256 & 0xFF == 0`,
-     a "size 0" header entry, and vanilla drops the chunk with only a warning. Fires
-     only on the largest chunks, so a small-world smoke test never sees it. Both
-     existing test fixtures have this latent.
-   - Export from a **checkpoint** (or a snapshot / `openReadOnly`), or a live scan tears.
+Remaining, in order:
 
-2. **Medium findings deferred from the last audit**, all real:
-   - **Shutdown-hook use-after-free.** `RocksMc.shutdown` does not stop
-     `RocksMcCommand.worker`. JVM hooks run concurrently, so `/rocksmc compact`
-     overlapping `/stop` can hit `closeNative()` mid-operation. No RocksJava operation
-     checks `isOwningHandle()` except `Checkpoint.create`, so this is a dangling
-     native pointer, not an exception. Fix: shut the worker down and await it, and/or
-     check `closed` under `LOCK`.
-   - `/rocksmc checkpoints` recursive `stat` walk on the tick thread
-     (`RocksMcCommand` → `CheckpointScheduler.directoryBytes`). Fine at
-     `checkpoint-keep=6`, bad at the configurable maximum. Dispatch it off-thread or
-     report file counts.
-   - `blobFileBytes()` does a full-directory `listFiles` per snapshot — cheap now
-     (72 entries), thousands of `.blob` files at multi-TB scale.
-   - Snapshot/scrape race against `closeNative` at shutdown (narrow window, every
-     shutdown).
+1. `exportWorld` Gradle task, mirroring `importWorld` (`build.gradle`, ~30 lines).
+2. Tests. The one that matters most: **`.mca` → import → export → `AnvilReader`**, asserting
+   the `{ChunkPos → NBT}` maps are equal. Reuse `AnvilReaderTest.writeRegion` /
+   `WorldImporterTest.writeRegion` as fixtures, plus **one chunk big enough to force the
+   ≥256-sector spill** through the whole path. Also needed: a test pinning that
+   serialise→parse→serialise is byte-stable, since the exporter's hash-based
+   verification depends on it.
+3. Verify on the real world: extract `~/kbackup-2025-09-29_02-06-31_before-recovery-rollback.zip`
+   to `/tmp`, `importWorld`, then `exportWorld`, then compare exported `.mca` against the
+   originals chunk-for-chunk. Expect 293,207.
+4. Docs: README roadmap (Phase 5 currently unchecked at line ~273), `beta-setup.md`
+   (a `.mca` exporter changes the rollback story — the `.mca` files stop being a
+   permanent 1.69 GiB tax and become regenerable on demand).
 
-3. **Phase 3 — `playerdata` + saved data.** Deliberately last: it widens the blast
-   radius to player inventories. Clean seams exist (`WorldSaveHandler.savePlayerData`/
-   `loadPlayerData`/`getSavedPlayerIds`, one call site each; `PersistentState.save` for
-   writes and `PersistentStateManager.readFromFile` for reads). ⚠️ Trap: on a read
-   failure vanilla **silently creates a fresh player** and then overwrites the good
-   data on logout, so returning null from a DB hook is not a no-op — it is data loss.
-   Note also that `README`'s old claim that `level.dat` is read before the session lock
-   was **wrong and has been corrected**: the lock is taken at `Main.java:110` and the
-   first read is on the next line, so the stated blocker for including `level.dat` does
-   not exist.
+Design decisions already made and agreed, do not relitigate:
+
+- Reuse vanilla `RegionFile`; do **not** hand-roll a writer.
+- Standalone tool (no Fabric Loader → no mixin → vanilla's writer is stock bytecode).
+- **Read-only open + snapshot** by default. For a running server the supported route is
+  `/rocksmc checkpoint` then `--database <world>/rocksmc-checkpoints/<name>`; pointing at
+  a live database would miss unflushed memtables.
+- Verification by SHA-256 of serialised NBT, not by holding NBT (memory).
+
+### Then: Phase 3 — `playerdata` + saved data
+
+Last on purpose: widens the blast radius to player inventories. Seams are clean
+(`WorldSaveHandler.savePlayerData`/`loadPlayerData`/`getSavedPlayerIds`, one call site
+each; `PersistentState.save` for writes, `PersistentStateManager.readFromFile` for reads).
+⚠️ Trap: on a read failure vanilla **silently creates a fresh player** and overwrites the
+good data on logout, so returning null from a DB hook is data loss, not a no-op.
+
+`data/` is the largest thing still unprotected by the database (scoreboard, maps,
+`idcounts.dat`, forceload, command storage) — only as safe as file backups.
 
 ### Operator-side, not code
 
-- Repeat the `kill -9` test on the target hardware (Optane + btrfs with `chattr +C`).
-  The four verified cycles ran on tmpfs, which has entirely different fsync behaviour.
-- The mirror still has its `.mca` files. They are the only rollback until Phase 5
-  exists; ~1.69 GiB across the six `region`/`poi` directories.
+- Repeat the `kill -9` test on target hardware (Optane + btrfs, `chattr +C`). The four
+  verified cycles ran on tmpfs, which has entirely different fsync behaviour.
+- The mirror still holds its `.mca` files (~1.69 GiB). They are the only rollback until
+  Phase 5 ships.
 
-### Methodological rules earned the hard way
+### Rules earned the hard way — do not rediscover these
 
-- **Verify from the shipped jar, not `runServer`.** Two bugs reached production that
-  dev mode could not show: a missing bundled Prometheus module, and the command
-  registration bug. `verifyBundledLibraries` now scans both bundled libraries and the
-  mod's own classes, and there is a real-jar + `/reload` test procedure.
+- **Verify from the shipped jar, not `runServer`.** Two bugs reached production that dev
+  mode could not show: a missing bundled Prometheus module, and command registration.
 - **Validate a probe in both directions before trusting it.** In-game probes once
   reported total data loss that had not happened.
-- **Never let a hand-maintained list be checked by care alone.** `ModMetadataTest`
-  guards the mixin list; `verifyBundledLibraries` guards the dependency list.
-- Log success, not only failure. The command bug was undiagnosable because
-  registration was silent, so the log distinguished "did not run" from "ran into a
-  discarded dispatcher" not at all.
+- **Never let a hand-maintained list be checked by care alone.** `ModMetadataTest` guards
+  the mixin list; `verifyBundledLibraries` guards the dependency list *and* the mod's own
+  classes.
+- **Log success, not only failure.** The command bug was undiagnosable because
+  registration was silent.
+- **Permission levels come from `ops.json`, not `op-permission-level`.** The latter is read
+  only when `/op` runs. Commands and alerts both require level 3.
+- **Prefer the simple fix.** I built configurable permission levels; a single `4`→`3` was
+  correct and the operator was right to reject the machinery.
+- A flaky test is worse than no test. `Thread.join(timeout)` returns whether or not the
+  thread finished — use a latch.
 
+---
 ---
 
 ## ✅ Phase 2 — consolidate to one database per world (DONE)
