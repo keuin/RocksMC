@@ -3,6 +3,9 @@ package com.keuin.rocksmc;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -95,15 +98,26 @@ class FailureReporterTest {
     @Test
     void concurrentReportsCollapseToOne() throws Exception {
         int threads = 8;
-        Thread[] workers = new Thread[threads];
+        // A latch rather than Thread.join(timeout), which returns whether or not the
+        // thread finished. Asserting an exact suppressed count while a worker might
+        // still be starved -- entirely possible when this runs alongside the RocksDB
+        // tests -- made this fail intermittently, which is worse than not testing it at
+        // all because it teaches people to re-run red builds.
+        CountDownLatch done = new CountDownLatch(threads);
         for (int i = 0; i < threads; i++) {
-            workers[i] = new Thread(() ->
-                FailureReporter.report(FailureReporter.Kind.SYNC_FAILURE, "race"));
-            workers[i].start();
+            Thread worker = new Thread(() -> {
+                try {
+                    FailureReporter.report(FailureReporter.Kind.SYNC_FAILURE, "race");
+                } finally {
+                    done.countDown();
+                }
+            });
+            worker.setDaemon(true);
+            worker.start();
         }
-        for (Thread worker : workers) {
-            worker.join(30_000L);
-        }
+
+        assertTrue(done.await(60, TimeUnit.SECONDS),
+            "workers did not finish; the count below would be meaningless");
         assertEquals(threads - 1,
             FailureReporter.suppressedCount(FailureReporter.Kind.SYNC_FAILURE),
             "exactly one thread should have reported; the rest counted as suppressed");

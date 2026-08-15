@@ -232,7 +232,17 @@ It appears again after every `/reload`. If it does not appear at all, the comman
 are genuinely absent — that is the symptom to report.
 
 
-Available in-game or from the console, all at permission level 4:
+Available in-game or from the console, all at permission level 3:
+
+⚠️ **If an operator cannot see `/rocksmc`, check `ops.json`, not `server.properties`.**
+A player's effective level is the `"level"` in their `ops.json` entry.
+`op-permission-level` in `server.properties` is consulted **only when `/op` runs**, so
+raising it does not change anyone already op'd — and a world copied from another server
+arrives with that server's levels. RCON always has level 4, which is why it can appear
+to work while an in-game operator cannot see the command at all.
+
+To raise an existing operator: `/deop <player>` then `/op <player>`, or edit the
+`"level"` in `ops.json` and restart. The same level gates the in-game failure alerts.
 
 ```
 /rocksmc stats                  per-store IO and per-database state
@@ -335,7 +345,7 @@ three-dimension world overstated disk usage by **6×** and key counts by **3×**
 
 Failures no longer wait for the stats timer. Any read/write/verify failure, write
 stop, throttle, or low-disk condition is logged as an ERROR the moment it happens and
-**broadcast in chat to online operators** (permission level 4), rate-limited to one
+**broadcast in chat to online operators** (permission level 3), rate-limited to one
 per minute per kind with the suppressed count reported. That path is independent of
 `stats-log-interval-seconds`, so it works even with the periodic log disabled.
 

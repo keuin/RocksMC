@@ -340,7 +340,7 @@ re-import command. The old directories are left untouched, so older builds and
 Registration is confirmed in the log (`rocksmc: registered /rocksmc (6 subcommands)`)
 on boot and again after each `/reload`.
 
-All require permission level 4. `flush`, `compact` and `checkpoint` run on a
+All require permission level 3. `flush`, `compact` and `checkpoint` run on a
 background thread and report to the server log when they finish, because a compaction
 of a real 1.1 GB database is not instant and running it on the server thread would
 stall every player. Only one runs at a time; a second request is refused rather than

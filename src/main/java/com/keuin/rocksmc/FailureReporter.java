@@ -36,9 +36,14 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Also sent to online operators, because silent data loss is the failure mode this
  * project has worked hardest to avoid and an operator watching chat should not have to
- * be tailing a log to find out. Deliberately limited to permission level 4: the
- * message names paths and failure counts, and ordinary players can neither act on it
- * nor should see it.
+ * be tailing a log to find out. Limited to permission level 3, matching the commands:
+ * the message names paths and failure counts, and ordinary players can neither act on
+ * it nor should see it.
+ *
+ * <p>Level 3 rather than 4 for the same reason the commands use 3. An operator's level
+ * comes from their per-player entry in {@code ops.json}, not from
+ * {@code op-permission-level}, which is only consulted when {@code /op} runs. A server
+ * whose operators sit at 3 would have had these alerts silently reach nobody.
  */
 public final class FailureReporter {
 
@@ -135,7 +140,7 @@ public final class FailureReporter {
     }
 
     /**
-     * Sends an alert to every online player at permission level 4.
+     * Sends an alert to every online player at permission level 3 or above.
      *
      * <p>Scheduled onto the server thread rather than sent directly: {@code report}
      * is called from RocksDB's IO workers and background threads, and touching the
@@ -158,8 +163,9 @@ public final class FailureReporter {
                     // hasPermissionLevel resolves through the server's own op list, so
                     // it already covers operator status; checking isOperator as well
                     // would be redundant and would disagree with the identical gate
-                    // used by the commands themselves.
-                    if (player.hasPermissionLevel(4)) {
+                    // used by the commands themselves. Kept at the same level as those
+                    // commands deliberately: whoever can act on an alert should get it.
+                    if (player.hasPermissionLevel(RocksMcCommand.PERMISSION_LEVEL)) {
                         player.sendMessage(text, false);
                     }
                 }

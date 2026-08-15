@@ -1,9 +1,9 @@
 package com.keuin.rocksmc;
 
 import com.mojang.brigadier.CommandDispatcher;
-import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.text.LiteralText;
@@ -11,11 +11,7 @@ import net.minecraft.text.Text;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -50,11 +46,21 @@ import java.util.concurrent.TimeUnit;
  * while one is running is refused rather than queued, so an operator cannot
  * accidentally stack six compactions by pressing enter repeatedly.
  *
- * <p>Every subcommand requires permission level 4 (server console or an operator at
- * the highest level), because they all either expose world size or consume real IO.
+ * <p>Every subcommand requires permission level 3 -- the level vanilla gives {@code /op}
+ * itself -- because they all either expose world size or consume real IO.
+ *
+ * <p>3 rather than 4, and that distinction is load-bearing. An operator's effective
+ * level is whatever their <b>per-player entry in {@code ops.json}</b> says, not
+ * {@code op-permission-level} from {@code server.properties}: that property is read only
+ * when {@code /op} is run, so raising it changes nobody already op'd. A server whose
+ * operators were op'd at 3 therefore could not see or run these commands at all, while
+ * RCON -- which hardcodes level 4 -- worked, which is a confusing way to discover it.
+ * Vanilla's own default for {@code op-permission-level} is 4, so requiring 3 works both
+ * on a default server and on one configured lower.
  */
 public final class RocksMcCommand {
 
+    public static final int PERMISSION_LEVEL = 3;
     /**
      * Runs the blocking subcommands. Created lazily so a server that never uses
      * them pays nothing, and daemon so a stuck compaction cannot hold up JVM exit.
@@ -107,7 +113,7 @@ public final class RocksMcCommand {
     static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
         LiteralArgumentBuilder<ServerCommandSource> root = CommandManager
             .literal("rocksmc")
-            .requires(source -> source.hasPermissionLevel(4));
+            .requires(source -> source.hasPermissionLevel(PERMISSION_LEVEL));
 
         root.then(CommandManager.literal("stats")
             .executes(context -> stats(context.getSource())));
