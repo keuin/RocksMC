@@ -66,6 +66,11 @@ class RocksMcConfigTest {
         assertEquals(36, c.level0StopTrigger());
         assertEquals(-1, c.maxOpenFiles());
         assertEquals(0L, c.maxTotalWalSize());
+        assertEquals(0L, c.maxAllowedSpaceBytes(), "no space cap by default");
+        assertEquals(2L * 1024 * 1024 * 1024, c.diskSpaceWarningBytes());
+        assertEquals(64L * 1024 * 1024, c.maxLogFileSize(),
+            "RocksDB's own default of 0 never rotates by size and grows unbounded");
+        assertEquals(4, c.keepLogFileNum());
         assertFalse(c.metricsEnabled());
         assertEquals("127.0.0.1", c.metricsBind());
         assertEquals(9940, c.metricsPort());
@@ -253,6 +258,10 @@ class RocksMcConfigTest {
             "level0-stop-writes-trigger", "40",
             "max-open-files", "512",
             "max-total-wal-size", "1073741824",
+            "max-allowed-space-bytes", "10737418240",
+            "disk-space-warning-bytes", "5368709120",
+            "max-log-file-size", "1048576",
+            "keep-log-file-num", "2",
             "metrics-enabled", "true",
             "metrics-bind", "0.0.0.0",
             "metrics-port", "9999",
@@ -279,6 +288,10 @@ class RocksMcConfigTest {
         assertEquals(original.level0StopTrigger(), copy.level0StopTrigger());
         assertEquals(original.maxOpenFiles(), copy.maxOpenFiles());
         assertEquals(original.maxTotalWalSize(), copy.maxTotalWalSize());
+        assertEquals(original.maxAllowedSpaceBytes(), copy.maxAllowedSpaceBytes());
+        assertEquals(original.diskSpaceWarningBytes(), copy.diskSpaceWarningBytes());
+        assertEquals(original.maxLogFileSize(), copy.maxLogFileSize());
+        assertEquals(original.keepLogFileNum(), copy.keepLogFileNum());
         assertEquals(original.metricsEnabled(), copy.metricsEnabled());
         assertEquals(original.metricsBind(), copy.metricsBind());
         assertEquals(original.metricsPort(), copy.metricsPort());

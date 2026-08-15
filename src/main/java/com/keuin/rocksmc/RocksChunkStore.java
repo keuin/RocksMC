@@ -147,6 +147,9 @@ public final class RocksChunkStore implements ChunkStore {
             value = this.database.handle().get(this.columnFamily, key(this.dimensionId, pos));
         } catch (RocksDBException e) {
             this.readFailures.incrementAndGet();
+            FailureReporter.report(FailureReporter.Kind.READ_FAILURE,
+                "chunk " + pos + " in " + this.dimensionIdentity + " could not be read: "
+                    + e.getMessage());
             throw new IOException("RocksDB read failed for " + pos, e);
         }
         if (value == null) {
@@ -176,6 +179,13 @@ public final class RocksChunkStore implements ChunkStore {
                 chunkKey, value);
         } catch (RocksDBException e) {
             this.writeFailures.incrementAndGet();
+            // Reported here rather than left to the stats timer: vanilla's
+            // StorageIoWorker catches the IOException, logs one line and continues,
+            // so without this a failed write is indistinguishable from an ordinary
+            // vanilla hiccup -- and the chunk is gone.
+            FailureReporter.report(FailureReporter.Kind.WRITE_FAILURE,
+                "chunk " + pos + " in " + this.dimensionIdentity + " was NOT saved: "
+                    + e.getMessage() + ". Data is being lost.");
             throw new IOException("RocksDB write failed for " + pos, e);
         }
         this.writes.incrementAndGet();
@@ -214,6 +224,10 @@ public final class RocksChunkStore implements ChunkStore {
         }
         if (!java.util.Arrays.equals(expected, actual)) {
             this.verifyFailures.incrementAndGet();
+            FailureReporter.report(FailureReporter.Kind.VERIFY_FAILURE,
+                "chunk " + pos + " in " + this.dimensionIdentity + " read back "
+                    + actual.length + " bytes, expected " + expected.length
+                    + " -- the storage layer is CORRUPTING data. Stop the server.");
             throw new IOException("verify-on-read: " + pos + " read back "
                 + actual.length + " bytes, expected " + expected.length
                 + " -- storage layer is corrupting data");

@@ -58,6 +58,10 @@ public final class RocksMcConfig {
         "level0-stop-writes-trigger",
         "max-open-files",
         "max-total-wal-size",
+        "max-allowed-space-bytes",
+        "disk-space-warning-bytes",
+        "max-log-file-size",
+        "keep-log-file-num",
         "metrics-enabled",
         "metrics-bind",
         "metrics-port",
@@ -81,6 +85,10 @@ public final class RocksMcConfig {
     private final int level0StopTrigger;
     private final int maxOpenFiles;
     private final long maxTotalWalSize;
+    private final long maxAllowedSpaceBytes;
+    private final long diskSpaceWarningBytes;
+    private final long maxLogFileSize;
+    private final int keepLogFileNum;
 
     private final boolean metricsEnabled;
     private final String metricsBind;
@@ -111,6 +119,10 @@ public final class RocksMcConfig {
         int level0StopTrigger = 36;
         int maxOpenFiles = -1;
         long maxTotalWalSize;
+        long maxAllowedSpaceBytes;
+        long diskSpaceWarningBytes = 2L * 1024 * 1024 * 1024;
+        long maxLogFileSize = 64L * 1024 * 1024;
+        int keepLogFileNum = 4;
         boolean metricsEnabled;
         String metricsBind = "127.0.0.1";
         int metricsPort = 9940;
@@ -135,6 +147,10 @@ public final class RocksMcConfig {
         this.level0StopTrigger = v.level0StopTrigger;
         this.maxOpenFiles = v.maxOpenFiles;
         this.maxTotalWalSize = v.maxTotalWalSize;
+        this.maxAllowedSpaceBytes = v.maxAllowedSpaceBytes;
+        this.diskSpaceWarningBytes = v.diskSpaceWarningBytes;
+        this.maxLogFileSize = v.maxLogFileSize;
+        this.keepLogFileNum = v.keepLogFileNum;
         this.metricsEnabled = v.metricsEnabled;
         this.metricsBind = v.metricsBind;
         this.metricsPort = v.metricsPort;
@@ -161,6 +177,10 @@ public final class RocksMcConfig {
         v.level0StopTrigger = this.level0StopTrigger;
         v.maxOpenFiles = this.maxOpenFiles;
         v.maxTotalWalSize = this.maxTotalWalSize;
+        v.maxAllowedSpaceBytes = this.maxAllowedSpaceBytes;
+        v.diskSpaceWarningBytes = this.diskSpaceWarningBytes;
+        v.maxLogFileSize = this.maxLogFileSize;
+        v.keepLogFileNum = this.keepLogFileNum;
         v.metricsEnabled = this.metricsEnabled;
         v.metricsBind = this.metricsBind;
         v.metricsPort = this.metricsPort;
@@ -243,6 +263,13 @@ public final class RocksMcConfig {
         v.maxOpenFiles = parseInt(props, "max-open-files", v.maxOpenFiles, -1, 1_000_000);
         v.maxTotalWalSize = parseLong(props, "max-total-wal-size",
             v.maxTotalWalSize, 0L, Long.MAX_VALUE);
+        v.maxAllowedSpaceBytes = parseLong(props, "max-allowed-space-bytes",
+            v.maxAllowedSpaceBytes, 0L, Long.MAX_VALUE);
+        v.diskSpaceWarningBytes = parseLong(props, "disk-space-warning-bytes",
+            v.diskSpaceWarningBytes, 0L, Long.MAX_VALUE);
+        v.maxLogFileSize = parseLong(props, "max-log-file-size",
+            v.maxLogFileSize, 0L, Long.MAX_VALUE);
+        v.keepLogFileNum = parseInt(props, "keep-log-file-num", v.keepLogFileNum, 1, 100_000);
 
         v.metricsEnabled = parseBool(props, "metrics-enabled", v.metricsEnabled);
         v.metricsBind = props.getProperty("metrics-bind", v.metricsBind).trim();
@@ -545,6 +572,53 @@ public final class RocksMcConfig {
      */
     public long maxTotalWalSize() {
         return this.maxTotalWalSize;
+    }
+
+    /**
+     * Hard cap on SST bytes, or 0 for no cap.
+     *
+     * <p>The only pre-emptive defence against filling the disk, and worth more than it
+     * looks. When RocksDB hits ENOSPC it latches a background error and refuses every
+     * subsequent write; RocksJava exposes no {@code DB::Resume()}, so <b>freeing space
+     * does not recover it</b> -- the database stays effectively read-only until the
+     * server restarts, while the server keeps running and silently persists nothing.
+     * Every world modification after the fill is then lost, with no crash to mark the
+     * boundary.
+     *
+     * <p>Failing writes at a configured ceiling instead turns that into a bounded,
+     * reported condition while there is still room to compact and react. Off by
+     * default because a sensible value depends on the volume, not on the mod.
+     */
+    public long maxAllowedSpaceBytes() {
+        return this.maxAllowedSpaceBytes;
+    }
+
+    /**
+     * Free-space threshold below which the mod warns, or 0 to disable.
+     *
+     * <p>A warning, not a limit: it exists to give an operator notice before the
+     * unrecoverable condition above, since the interesting moment is well before the
+     * disk is actually full. Defaults to 2 GiB.
+     */
+    public long diskSpaceWarningBytes() {
+        return this.diskSpaceWarningBytes;
+    }
+
+    /**
+     * Size at which RocksDB rotates its own {@code LOG}.
+     *
+     * <p>RocksDB's default is 0, meaning never rotate by size -- the file only rolls
+     * when the database is reopened. With stats dumps every 600 s that is roughly
+     * 2.5 MB/day inside the world directory, in one file, invisible to every size
+     * metric this mod exposes, and unbounded on a server that never restarts.
+     */
+    public long maxLogFileSize() {
+        return this.maxLogFileSize;
+    }
+
+    /** How many rotated RocksDB {@code LOG} files to keep. */
+    public int keepLogFileNum() {
+        return this.keepLogFileNum;
     }
 
     /**

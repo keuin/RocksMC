@@ -9,10 +9,12 @@ import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
+import org.rocksdb.Env;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.LRUCache;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.SstFileManager;
 import org.rocksdb.WriteOptions;
 
 import java.io.File;
@@ -143,6 +145,7 @@ public final class RocksDatabase {
     private final WriteOptions writeOptions;
     private final BloomFilter bloomFilter;
     private final Cache blockCache;
+    private final SstFileManager sstFileManager;
     private final DimensionRegistry dimensionRegistry;
 
     /** Column family handles by name, including {@code default}. */
@@ -257,6 +260,13 @@ public final class RocksDatabase {
             // up until file close, which otherwise shows up as a tick stall.
             .setBytesPerSync(config.bytesPerSync())
             .setWalBytesPerSync(config.bytesPerSync())
+            // RocksDB's own LOG defaults to never rotating by size (max_log_file_size
+            // = 0), so it only rolls when the database is reopened. With stats dumps
+            // every 600s that is roughly 2.5 MB/day inside the world directory, in a
+            // single file, invisible to every size metric this mod exposes -- and a
+            // server that never restarts grows it without bound.
+            .setMaxLogFileSize(config.maxLogFileSize())
+            .setKeepLogFileNum(config.keepLogFileNum())
             // Unlimited by default, matching RocksDB. Settable because a large
             // world's blob files accumulate and a shared host with a low
             // RLIMIT_NOFILE otherwise dies days later with "too many open files".
@@ -268,6 +278,28 @@ public final class RocksDatabase {
         if (config.maxTotalWalSize() > 0) {
             this.dbOptions.setMaxTotalWalSize(config.maxTotalWalSize());
         }
+
+        // A space cap, if configured. This is the only pre-emptive defence available
+        // against filling the disk, and it matters more than it looks: when RocksDB
+        // hits ENOSPC it latches a background error and refuses all further writes,
+        // and RocksJava exposes no DB::Resume(), so freeing space does NOT recover the
+        // database -- it stays read-only until the server restarts. Meanwhile the
+        // server keeps running and silently persists nothing. Failing writes early,
+        // while there is still headroom to compact and to react, is far better.
+        SstFileManager manager = null;
+        if (config.maxAllowedSpaceBytes() > 0) {
+            try {
+                manager = new SstFileManager(Env.getDefault());
+                manager.setMaxAllowedSpaceUsage(config.maxAllowedSpaceBytes());
+                this.dbOptions.setSstFileManager(manager);
+            } catch (RocksDBException e) {
+                // Not fatal: the database is still usable, just without the cap.
+                RocksMc.logger().error("rocksmc: could not install the SST file "
+                    + "manager, so max-allowed-space-bytes is NOT in effect", e);
+                manager = null;
+            }
+        }
+        this.sstFileManager = manager;
 
         this.writeOptions = new WriteOptions().setSync(config.syncWrites());
 
@@ -741,6 +773,9 @@ public final class RocksDatabase {
         // freed cache during teardown.
         if (this.blockCache != null) {
             this.blockCache.close();
+        }
+        if (this.sstFileManager != null) {
+            this.sstFileManager.close();
         }
     }
 

@@ -43,6 +43,21 @@ dependencies {
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
+    // fabric-command-api-v1, and ONLY that module -- not the whole Fabric API.
+    //
+    // Needed because vanilla rebuilds CommandManager (and its CommandDispatcher)
+    // on every datapack reload: MinecraftServer.reloadResources constructs a fresh
+    // ServerResourceManager, so anything registered once into the first dispatcher
+    // is silently discarded. That is not hypothetical -- it is exactly how
+    // /rocksmc came to be missing on the beta server, where another mod triggers a
+    // reload after startup. CommandRegistrationCallback re-fires per construction,
+    // which is the whole point of it existing.
+    //
+    // modImplementation without include(): this is a dependency the server
+    // provides, not something to bundle. Bundling an API module would risk
+    // shadowing the server's own copy.
+    modImplementation fabricApi.module("fabric-command-api-v1", project.fabric_api_version)
+
     // RocksDB ships platform natives inside the jar, so it must be bundled into
     // the mod rather than merely compiled against.
     implementation include("org.rocksdb:rocksdbjni:${project.rocksdb_version}")
@@ -250,6 +265,84 @@ tasks.register('verifyBundledLibraries') {
             logger.lifecycle("verifyBundledLibraries: ${checked} classes link " +
                 "using only the bundled jars")
 
+            // ---------------------------------------------------------------
+            // Phase 2: the mod's OWN classes.
+            //
+            // Phase 1 only proves the bundled libraries link against each other. It
+            // says nothing about the code in com/keuin/rocksmc, which is where a
+            // reference to an unbundled, unprovided class would actually be written.
+            // The task's own description claimed to answer "can every class the mod
+            // ships link", and did not.
+            //
+            // Two differences from phase 1. The classloader also sees what a real
+            // server provides -- Minecraft, the loader, the Fabric API module -- since
+            // the mod is entitled to use those; a jar that is bundled is excluded from
+            // that side so it is only satisfied from the bundle. And references are
+            // read from the constant pool rather than by Class.forName, because
+            // forName resolves supertypes only: a missing method-reference target
+            // would link fine here and fail on the first call at runtime.
+            // ---------------------------------------------------------------
+            def nestedNames = nested.collect { it.name } as Set
+            def providedJars = sourceSets.main.compileClasspath.files.findAll {
+                it.name.endsWith('.jar') && !nestedNames.contains(it.name)
+            }
+            // The mod jar itself is on this loader too, or every intra-mod reference
+            // reports as missing. Only external references are in question here.
+            // 'nested' rather than 'libs': phase 1 skips rocksdbjni as too large to
+            // scan, but the mod genuinely calls into it, so it must be resolvable here.
+            def modLoaderUrls = ([modJar] + nested + providedJars)
+                .collect { it.toURI().toURL() } as URL[]
+            def modLoader = new URLClassLoader(modLoaderUrls, ClassLoader.getPlatformClassLoader())
+
+            def modFailures = [:]
+            def modClasses = 0
+            def refsChecked = 0
+            new java.util.zip.ZipFile(modJar).withCloseable { zip ->
+                zip.entries().findAll {
+                    it.name.startsWith('com/keuin/rocksmc/') && it.name.endsWith('.class')
+                }.each { entry ->
+                    modClasses++
+                    def bytes = zip.getInputStream(entry).withStream { it.bytes }
+                    def owner = entry.name[0..-7].replace('/', '.')
+                    constantPoolClassRefs(bytes).findAll { ref ->
+                        // net.minecraft is skipped, and has to be: the shipped jar is
+                        // remapped to intermediary (net.minecraft.class_2487) while the
+                        // compile classpath holds the Yarn-named jar, so the two can
+                        // never match by name. Minecraft is also unconditionally
+                        // provided by the server, so it is not a bundling risk -- which
+                        // is what this check is about.
+                        !ref.startsWith('net.minecraft.')
+                    }.each { ref ->
+                        refsChecked++
+                        try {
+                            Class.forName(ref, false, modLoader)
+                        } catch (Throwable t) {
+                            modFailures.computeIfAbsent(ref, { [] }) << owner
+                        }
+                    }
+                }
+            }
+            if (modClasses == 0) {
+                throw new GradleException('no com/keuin/rocksmc classes found in the ' +
+                    'mod jar -- this check would pass vacuously')
+            }
+            if (!modFailures.isEmpty()) {
+                def report = new StringBuilder()
+                report << "\n${modFailures.size()} class(es) referenced by the mod " +
+                    "cannot be resolved from the bundled jars plus what a server " +
+                    "provides.\nEach would be a NoClassDefFoundError at runtime.\n\n"
+                modFailures.each { missing, users ->
+                    report << "  MISSING: ${missing}\n"
+                    users.unique().take(5).each { report << "    used by ${it}\n" }
+                    report << "    fix: bundle the owning library with " +
+                        "implementation include(...), or add the Fabric API module " +
+                        "that provides it, or stop using it\n\n"
+                }
+                throw new GradleException(report.toString())
+            }
+            logger.lifecycle("verifyBundledLibraries: ${modClasses} mod classes, " +
+                "${refsChecked} class references all resolvable")
+
             // Linking is necessary but NOT sufficient: a class loaded lazily on the
             // first scrape would still pass the scan above and then fail on a live
             // server. So actually stand the exporter up and scrape it, over real
@@ -429,4 +522,74 @@ tasks.register('fidelity', JavaExec) {
         }
         args = argv
     }
+}
+
+// ---------------------------------------------------------------------------
+// constantPoolClassRefs: every class named in a .class file's constant pool.
+//
+// Used by verifyBundledLibraries' second phase. Class.forName resolves a class's
+// supertypes and interfaces but leaves method and field references to be resolved
+// lazily on first use, so it cannot see a missing method-reference target -- which
+// is most of what mod code actually depends on. Reading CONSTANT_Class entries
+// directly catches all of it, and needs no ASM dependency.
+//
+// The pool is walked rather than scanned, because entry sizes vary and Long/Double
+// occupy two slots each; a naive scan would desynchronise and produce nonsense.
+// ---------------------------------------------------------------------------
+static Set<String> constantPoolClassRefs(byte[] bytes) {
+    def input = new DataInputStream(new ByteArrayInputStream(bytes))
+    // Masked to a long before comparing: Groovy widens the 0xCAFEBABE literal to a
+    // Long, while readInt() returns a negative signed int, so a direct comparison is
+    // never equal and would reject every class file.
+    if ((input.readInt() & 0xFFFFFFFFL) != 0xCAFEBABEL) {
+        throw new GradleException('not a class file')
+    }
+    input.readUnsignedShort() // minor
+    input.readUnsignedShort() // major
+    int count = input.readUnsignedShort()
+
+    def utf8 = [:]
+    def classNameIndex = []
+    for (int i = 1; i < count; i++) {
+        int tag = input.readUnsignedByte()
+        switch (tag) {
+            case 1:  utf8[i] = input.readUTF(); break
+            case 7:  classNameIndex << input.readUnsignedShort(); break
+            case 8: case 16: case 19: case 20:
+                input.skipBytes(2); break
+            case 15: input.skipBytes(3); break
+            case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18:
+                input.skipBytes(4); break
+            case 5: case 6:
+                input.skipBytes(8)
+                // Long and Double take two constant pool slots. Vanishingly rare in
+                // practice and exactly the kind of detail that silently corrupts the
+                // rest of the walk if missed.
+                i++
+                break
+            default:
+                throw new GradleException("unknown constant pool tag ${tag}")
+        }
+    }
+
+    def refs = new LinkedHashSet<String>()
+    classNameIndex.each { index ->
+        def raw = utf8[index]
+        if (raw == null) {
+            return
+        }
+        // A CONSTANT_Class name is either an internal name (java/lang/String) or, for
+        // array types, a descriptor ([Ljava/lang/String; or [[I).
+        def name = raw
+        while (name.startsWith('[')) {
+            name = name.substring(1)
+        }
+        if (name.startsWith('L') && name.endsWith(';')) {
+            name = name.substring(1, name.length() - 1)
+        } else if (name.length() <= 1) {
+            return // a primitive array element type; nothing to resolve
+        }
+        refs << name.replace('/', '.')
+    }
+    return refs
 }

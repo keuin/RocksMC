@@ -5,6 +5,91 @@ as well as the steps.
 
 ---
 
+## ⏸ WHERE THINGS STAND (read this first)
+
+Everything below the next divider is history. The current state:
+
+**Just landed** (see the two most recent commits): operator commands, six verified
+defects, scheduled checkpoints, and then a production bug fix plus three High-severity
+robustness findings. 174 tests pass; `./gradlew build` is clean.
+
+**Deployed and working** on the beta mirror at `/opt/onesmp/mirror_rocksmc` — a real
+293,207-chunk world, POI verified live by the operator (villagers keep professions and
+beds across restarts).
+
+### Next up, in order
+
+1. **Phase 5 — `.mca` exporter.** Fully researched, not started. Scope ~1,200–1,750 LOC
+   with tests. Key findings from that research, so it need not be redone:
+   - **Reuse vanilla `RegionFile`** (`public`, non-final, public constructors) rather
+     than hand-rolling a writer. It already handles framing, the sector allocator, the
+     header rewrite, `.mcc` spill and end-of-file alignment.
+   - Run it as a **standalone tool** (a third `*Main` beside `ImportMain`/`FidelityMain`)
+     so no Fabric Loader means no mixin, and vanilla's writer is stock bytecode.
+   - `AnvilReader.stream` is the read-back verifier — an independent oracle already.
+   - **Morton keys group by region file for free**: for any region, its 1024 chunks are
+     1024 consecutive Morton codes aligned to a 1024 boundary
+     (`morton >> 10` identifies the region). So a single forward scan yields chunks
+     already grouped, one `RegionFile` open at a time, and per-region parallelism is a
+     computable key range. No sort, no seek-per-region.
+   - The Morton **inverse** exists only in `ChunkKeyTest` (`unspreadHigh`/`unspreadLow`/
+     `compact`); promote it beside `morton`/`spread` and have the test call it.
+   - Highest-severity risk if hand-rolling: `sectors >= 256` writes `256 & 0xFF == 0`,
+     a "size 0" header entry, and vanilla drops the chunk with only a warning. Fires
+     only on the largest chunks, so a small-world smoke test never sees it. Both
+     existing test fixtures have this latent.
+   - Export from a **checkpoint** (or a snapshot / `openReadOnly`), or a live scan tears.
+
+2. **Medium findings deferred from the last audit**, all real:
+   - **Shutdown-hook use-after-free.** `RocksMc.shutdown` does not stop
+     `RocksMcCommand.worker`. JVM hooks run concurrently, so `/rocksmc compact`
+     overlapping `/stop` can hit `closeNative()` mid-operation. No RocksJava operation
+     checks `isOwningHandle()` except `Checkpoint.create`, so this is a dangling
+     native pointer, not an exception. Fix: shut the worker down and await it, and/or
+     check `closed` under `LOCK`.
+   - `/rocksmc checkpoints` recursive `stat` walk on the tick thread
+     (`RocksMcCommand` → `CheckpointScheduler.directoryBytes`). Fine at
+     `checkpoint-keep=6`, bad at the configurable maximum. Dispatch it off-thread or
+     report file counts.
+   - `blobFileBytes()` does a full-directory `listFiles` per snapshot — cheap now
+     (72 entries), thousands of `.blob` files at multi-TB scale.
+   - Snapshot/scrape race against `closeNative` at shutdown (narrow window, every
+     shutdown).
+
+3. **Phase 3 — `playerdata` + saved data.** Deliberately last: it widens the blast
+   radius to player inventories. Clean seams exist (`WorldSaveHandler.savePlayerData`/
+   `loadPlayerData`/`getSavedPlayerIds`, one call site each; `PersistentState.save` for
+   writes and `PersistentStateManager.readFromFile` for reads). ⚠️ Trap: on a read
+   failure vanilla **silently creates a fresh player** and then overwrites the good
+   data on logout, so returning null from a DB hook is not a no-op — it is data loss.
+   Note also that `README`'s old claim that `level.dat` is read before the session lock
+   was **wrong and has been corrected**: the lock is taken at `Main.java:110` and the
+   first read is on the next line, so the stated blocker for including `level.dat` does
+   not exist.
+
+### Operator-side, not code
+
+- Repeat the `kill -9` test on the target hardware (Optane + btrfs with `chattr +C`).
+  The four verified cycles ran on tmpfs, which has entirely different fsync behaviour.
+- The mirror still has its `.mca` files. They are the only rollback until Phase 5
+  exists; ~1.69 GiB across the six `region`/`poi` directories.
+
+### Methodological rules earned the hard way
+
+- **Verify from the shipped jar, not `runServer`.** Two bugs reached production that
+  dev mode could not show: a missing bundled Prometheus module, and the command
+  registration bug. `verifyBundledLibraries` now scans both bundled libraries and the
+  mod's own classes, and there is a real-jar + `/reload` test procedure.
+- **Validate a probe in both directions before trusting it.** In-game probes once
+  reported total data loss that had not happened.
+- **Never let a hand-maintained list be checked by care alone.** `ModMetadataTest`
+  guards the mixin list; `verifyBundledLibraries` guards the dependency list.
+- Log success, not only failure. The command bug was undiagnosable because
+  registration was silent, so the log distinguished "did not run" from "ran into a
+  discarded dispatcher" not at all.
+
+---
+
 ## ✅ Phase 2 — consolidate to one database per world (DONE)
 
 **Status:** delivered and verified on the real world
@@ -106,10 +191,8 @@ Do not describe the current state as atomic cross-subsystem commits.
 
 ## Before the beta
 
-- [ ] **Run a live server with villagers** and confirm POI writes appear
-      (`rocksmc_chunk_writes_total{store="poi"}` non-zero). POI has still never been
-      exercised by a live server — only by the importer and the harness. This is the
-      highest untested risk.
+- [x] **POI under a live server** — confirmed by the operator: villagers keep
+      professions and beds across a restart.
 - [ ] Repeat the `kill -9` test on the **target hardware and filesystem** (Optane +
       btrfs with `chattr +C`). The four cycles here ran on tmpfs, which has entirely
       different fsync and writeback behaviour.

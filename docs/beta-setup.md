@@ -148,12 +148,38 @@ bytes-per-sync=1048576
 block-cache-size=536870912
 level0-slowdown-writes-trigger=24
 
+# Safety limits. max-allowed-space-bytes is the ONLY pre-emptive defence against
+# a full disk -- see the warning below. Set it below the volume size.
+max-allowed-space-bytes=0
+disk-space-warning-bytes=2147483648
+max-log-file-size=67108864
+keep-log-file-num=4
+
 # Telemetry
 metrics-enabled=true
 metrics-bind=127.0.0.1
 metrics-port=9940
 stats-log-interval-seconds=60
 ```
+
+⚠️ **A full disk is unrecoverable without a restart.** When RocksDB hits `ENOSPC` it
+latches a background error and refuses every subsequent write. RocksJava exposes no
+`DB::Resume()`, so **freeing space does not fix it** — the database stays effectively
+read-only until the server restarts, while the server keeps running, looks healthy,
+and silently persists nothing. Every world change after the fill is then lost, with
+no crash to mark the boundary.
+
+Two mitigations, both worth using:
+
+- `max-allowed-space-bytes` caps SST bytes so writes fail at a ceiling you choose,
+  while there is still room to compact and react. Off by default because a sensible
+  value depends on the volume.
+- `disk-space-warning-bytes` warns below a free-space threshold. Checked on its own
+  one-minute timer, so it still works with `stats-log-interval-seconds=0`.
+
+Also note `max-log-file-size`: RocksDB's own default never rotates its `LOG` by size,
+so on a server that does not restart it grows without bound (~2.5 MB/day) inside the
+world directory, invisible to every size metric here.
 
 Reasoning for the choices that matter:
 
@@ -191,6 +217,20 @@ Also note: **`sync-chunk-writes` in `server.properties` has no effect** with thi
 backend. The mod logs a warning about it at startup.
 
 ## 5. Commands
+
+⚠️ **Requires `fabric-command-api-v1`** (one Fabric API module, not the whole API).
+Any server already running Fabric API has it. Without it the mod refuses to load
+rather than starting with the commands missing.
+
+On boot you should see, and can grep for:
+
+```
+rocksmc: registered /rocksmc (6 subcommands)
+```
+
+It appears again after every `/reload`. If it does not appear at all, the commands
+are genuinely absent — that is the symptom to report.
+
 
 Available in-game or from the console, all at permission level 4:
 
@@ -292,6 +332,12 @@ three-dimension world overstated disk usage by **6×** and key counts by **3×**
 | `rocksmc_delayed_write_rate` | Non-zero means throttling has begun — the early warning before a stop |
 | `rocksmc_pending_compaction_bytes_by_cf` | Rising steadily means background work is losing. Raise `max-background-jobs` |
 | `rocksmc_verify_failures_total` | **Must stay 0.** Any increase means the storage layer is corrupting data — stop and roll back |
+
+Failures no longer wait for the stats timer. Any read/write/verify failure, write
+stop, throttle, or low-disk condition is logged as an ERROR the moment it happens and
+**broadcast in chat to online operators** (permission level 4), rate-limited to one
+per minute per kind with the suppressed count reported. That path is independent of
+`stats-log-interval-seconds`, so it works even with the periodic log disabled.
 
 Also worth a glance: `rocksmc_databases` must read **1** per world. If it ever
 tracks `rocksmc_stores` instead, the shared-handle consolidation has broken and a

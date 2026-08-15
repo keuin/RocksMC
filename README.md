@@ -337,6 +337,9 @@ re-import command. The old directories are left untouched, so older builds and
 | `/rocksmc checkpoint [name]` | Consistent snapshot under `<world>/rocksmc-checkpoints/` |
 | `/rocksmc checkpoints` | List them, marking which retention may delete |
 
+Registration is confirmed in the log (`rocksmc: registered /rocksmc (6 subcommands)`)
+on boot and again after each `/reload`.
+
 All require permission level 4. `flush`, `compact` and `checkpoint` run on a
 background thread and report to the server log when they finish, because a compaction
 of a real 1.1 GB database is not instant and running it on the server thread would
@@ -353,8 +356,18 @@ structurally cannot offer. But the links share blocks with the live database, so
 protects against logical corruption and bad deploys, **not** against losing the drive.
 It is not an off-device backup.
 
-Registered by mixing into `CommandManager`'s constructor rather than via
-`CommandRegistrationCallback`, so the mod still needs no `fabric-api` dependency.
+Registered through `CommandRegistrationCallback`, which is why the mod depends on
+**`fabric-command-api-v1`** (that one module, not the whole Fabric API).
+
+⚠️ The obvious-looking alternative — injecting once into `CommandManager`'s
+constructor — is wrong, and shipped broken once. Vanilla rebuilds `CommandManager`
+and its `CommandDispatcher` on every datapack reload
+(`MinecraftServer.reloadResources`), so a one-shot registration is silently
+discarded the first time anything triggers a reload. On a real server another mod
+did exactly that after startup, and `/rocksmc` simply did not exist — with nothing
+in the log either way, because as far as the mixin could tell nothing had gone
+wrong. The callback re-fires per command-tree build; registration is now logged, so
+its absence is diagnosable.
 
 ## Metrics
 

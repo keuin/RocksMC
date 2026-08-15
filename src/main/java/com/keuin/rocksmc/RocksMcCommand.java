@@ -1,6 +1,7 @@
 package com.keuin.rocksmc;
 
 import com.mojang.brigadier.CommandDispatcher;
+import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.minecraft.server.command.CommandManager;
@@ -65,7 +66,44 @@ public final class RocksMcCommand {
     /** Set while a background operation is running, so a second is refused. */
     private static String running;
 
-    public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
+    /**
+     * Subscribes to command-tree construction.
+     *
+     * <p>Called once from the mod initialiser. The callback then fires every time
+     * vanilla builds a command tree, which is what makes this correct where a
+     * one-shot registration was not.
+     *
+     * <h2>⚠️ Why not register directly, or from a mixin on CommandManager</h2>
+     *
+     * <p>Because the dispatcher is not stable for the life of the server.
+     * {@code MinecraftServer.reloadResources} builds a fresh
+     * {@code ServerResourceManager}, which constructs a fresh {@code CommandManager}
+     * with a fresh {@code CommandDispatcher}. Anything registered into the previous
+     * one is discarded, silently and with no log line.
+     *
+     * <p>This mod previously did register once, from an {@code @Inject} at the tail
+     * of {@code CommandManager}'s constructor. It worked in a bare development
+     * server and failed on a real one: a mod in the stack triggered a reload after
+     * startup, the dispatcher was replaced, and {@code /rocksmc} simply did not
+     * exist -- with nothing in the log to say so, because nothing had gone wrong as
+     * far as the mixin could tell. The seam was right; registering once was wrong.
+     *
+     * <p>{@link CommandRegistrationCallback} is the API built for exactly this. Its
+     * own implementation injects at the same place, but as an event that re-fires per
+     * construction rather than a single registration.
+     */
+    public static void registerCallback() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, dedicated) ->
+            register(dispatcher));
+    }
+
+    /**
+     * Adds {@code /rocksmc} to one dispatcher.
+     *
+     * <p>Package-private and idempotent per dispatcher: it is invoked once per
+     * command-tree build, so it must assume nothing about how many times it runs.
+     */
+    static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
         LiteralArgumentBuilder<ServerCommandSource> root = CommandManager
             .literal("rocksmc")
             .requires(source -> source.hasPermissionLevel(4));
@@ -105,6 +143,12 @@ public final class RocksMcCommand {
             .executes(context -> listCheckpoints(context.getSource())));
 
         dispatcher.register(root);
+        // Logged on every command-tree build, not just the first. The previous bug
+        // was undiagnosable precisely because success was silent: the log showed
+        // neither a registration nor a failure, so there was no way to tell "did not
+        // run" from "ran into a dispatcher that was later thrown away".
+        RocksMc.logger().info("rocksmc: registered /rocksmc ({} subcommands)",
+            subcommands().size());
     }
 
     /**

@@ -32,6 +32,7 @@ public final class RocksMc implements DedicatedServerModInitializer {
     private static RocksMcConfig config = RocksMcConfig.defaults();
     private static MetricsExporter metrics;
     private static ScheduledExecutorService statsLogger;
+    private static ScheduledExecutorService diskWatchdog;
 
     public static RocksMcConfig config() {
         return config;
@@ -45,6 +46,12 @@ public final class RocksMc implements DedicatedServerModInitializer {
     public void onInitializeServer() {
         config = loadConfig();
         LOGGER.info("rocksmc loaded: {}", config);
+
+        // Before the backend check, deliberately. With backend=anvil the commands
+        // still answer -- reporting that no database is open -- which is more useful
+        // than a missing command an operator has to guess about, and it means
+        // /rocksmc stats can confirm which backend is actually live.
+        RocksMcCommand.registerCallback();
 
         if (!config.rocksEnabled()) {
             LOGGER.info("Backend is 'anvil' (vanilla). Set backend=rocksdb in "
@@ -74,6 +81,7 @@ public final class RocksMc implements DedicatedServerModInitializer {
             metrics = MetricsExporter.start(config.metricsBind(), config.metricsPort());
         }
         startStatsLogger();
+        startDiskWatchdog();
         CheckpointScheduler.start(config);
         Runtime.getRuntime().addShutdownHook(new Thread(RocksMc::shutdown, "rocksmc-shutdown"));
     }
@@ -104,6 +112,49 @@ public final class RocksMc implements DedicatedServerModInitializer {
             TimeUnit.SECONDS);
     }
 
+    /**
+     * Warns when free space on the world's volume runs low.
+     *
+     * <p>Deliberately its own timer rather than part of the stats logger. The stats
+     * interval is operator-tunable and can be set to 0 -- the beta server runs it that
+     * way -- and disabling periodic statistics should not also disable the warning
+     * that precedes an unrecoverable disk-full state. Fixed at one minute because this
+     * is a safety net, not a metric.
+     */
+    private static void startDiskWatchdog() {
+        if (config.diskSpaceWarningBytes() <= 0) {
+            return;
+        }
+        diskWatchdog = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread t = new Thread(runnable, "rocksmc-disk");
+            t.setDaemon(true);
+            return t;
+        });
+        diskWatchdog.scheduleAtFixedRate(RocksMc::checkDiskSpace, 60, 60, TimeUnit.SECONDS);
+    }
+
+    private static void checkDiskSpace() {
+        try {
+            long threshold = config.diskSpaceWarningBytes();
+            for (RocksDatabase database : StoreRegistry.databases()) {
+                long usable = database.path().getUsableSpace();
+                // 0 means the path is unavailable or the query failed; do not read
+                // that as "disk full" and cry wolf.
+                if (usable > 0 && usable < threshold) {
+                    FailureReporter.report(FailureReporter.Kind.DISK_LOW,
+                        database.name() + ": only "
+                            + CheckpointScheduler.formatBytes(usable)
+                            + " free. If this reaches zero RocksDB latches a "
+                            + "background error and refuses ALL further writes, and "
+                            + "freeing space does NOT recover it -- the server must be "
+                            + "restarted. Free space now.");
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("rocksmc: disk space check failed", t);
+        }
+    }
+
     private static void logStats() {
         try {
             for (RocksChunkStore store : StoreRegistry.stores()) {
@@ -113,9 +164,12 @@ public final class RocksMc implements DedicatedServerModInitializer {
                     s.database, s.dimension, s.leaf, s.reads, s.writes,
                     s.bytesRead, s.bytesWritten, s.dimensionOrdinal);
                 if (s.readFailures + s.writeFailures + s.verifyFailures > 0) {
-                    LOGGER.error("rocksmc: failures on {} [{}]: read={} write={} verify={}",
-                        s.dimension, s.leaf, s.readFailures, s.writeFailures,
-                        s.verifyFailures);
+                    // A running total, alongside the immediate per-failure alerts
+                    // raised from the store itself. Kept because a cumulative count
+                    // is what tells an operator whether a fault is ongoing.
+                    LOGGER.error("rocksmc: cumulative failures on {} [{}]: read={} "
+                        + "write={} verify={}", s.dimension, s.leaf, s.readFailures,
+                        s.writeFailures, s.verifyFailures);
                 }
             }
 
@@ -139,15 +193,24 @@ public final class RocksMc implements DedicatedServerModInitializer {
                 // Surface the two conditions that actually cause tick lag, rather
                 // than leaving an operator to spot them in a wall of numbers.
                 if (d.writeStopped > 0) {
-                    LOGGER.error("rocksmc: writes are STOPPED on {} -- compaction "
-                        + "cannot keep up. Raise max-background-jobs.", d.database);
+                    FailureReporter.report(FailureReporter.Kind.WRITE_STOPPED,
+                        d.database + ": writes are STOPPED -- compaction cannot keep "
+                            + "up. Raise max-background-jobs. Chunks are not being "
+                            + "saved.");
                 } else if (d.delayedWriteRate > 0) {
-                    LOGGER.warn("rocksmc: writes are being throttled on {} to {} B/s.",
-                        d.database, d.delayedWriteRate);
+                    FailureReporter.report(FailureReporter.Kind.WRITE_THROTTLED,
+                        d.database + ": writes throttled to " + d.delayedWriteRate
+                            + " B/s -- compaction is falling behind.");
                 }
             }
-        } catch (RuntimeException e) {
-            LOGGER.warn("rocksmc: stats logging failed", e);
+        } catch (Throwable t) {
+            // Throwable, not RuntimeException. scheduleAtFixedRate cancels a task
+            // permanently and silently on any escaping throwable, so an Error here --
+            // an OutOfMemoryError during a spike, a LinkageError on a lazily loaded
+            // log4j path -- would stop stats for the rest of the server's life with
+            // nothing to mark the transition. CheckpointScheduler already gets this
+            // right; this did not.
+            LOGGER.warn("rocksmc: stats logging failed", t);
         }
     }
 
@@ -157,6 +220,9 @@ public final class RocksMc implements DedicatedServerModInitializer {
         CheckpointScheduler.stop();
         if (statsLogger != null) {
             statsLogger.shutdownNow();
+        }
+        if (diskWatchdog != null) {
+            diskWatchdog.shutdownNow();
         }
         if (metrics != null) {
             metrics.close();
@@ -334,6 +400,28 @@ public final class RocksMc implements DedicatedServerModInitializer {
             + "# durability mechanism, so bounding it bounds recovery time and the\n"
             + "# disk a mostly-idle world can hold.\n"
             + "max-total-wal-size=0\n"
+            + "\n"
+            + "# Hard cap on SST bytes; 0 means no cap. THIS IS THE ONLY PRE-EMPTIVE\n"
+            + "# DEFENCE AGAINST A FULL DISK, and it matters more than it looks: when\n"
+            + "# RocksDB hits ENOSPC it latches a background error and refuses every\n"
+            + "# further write, and the Java API exposes no DB::Resume(), so freeing\n"
+            + "# space does NOT recover it -- the database stays effectively read-only\n"
+            + "# until the server is restarted, while the server keeps running and\n"
+            + "# silently persists nothing. Set this below the volume size so writes\n"
+            + "# fail while there is still room to compact and react.\n"
+            + "max-allowed-space-bytes=0\n"
+            + "\n"
+            + "# Warn when free space on the world's volume drops below this. 0\n"
+            + "# disables. Checked once a minute on its own timer, so it keeps working\n"
+            + "# with stats-log-interval-seconds=0. 2 GiB.\n"
+            + "disk-space-warning-bytes=2147483648\n"
+            + "\n"
+            + "# Rotation for RocksDB's own LOG file inside the database directory.\n"
+            + "# RocksDB defaults to never rotating by size, so on a server that does\n"
+            + "# not restart the file grows without bound (~2.5 MB/day with the default\n"
+            + "# stats dump interval) and is invisible to every size metric here.\n"
+            + "max-log-file-size=67108864\n"
+            + "keep-log-file-num=4\n"
             + "\n"
             + "# ---------------------------------------------------------------------\n"
             + "# Checkpoints (rollback safety net)\n"
