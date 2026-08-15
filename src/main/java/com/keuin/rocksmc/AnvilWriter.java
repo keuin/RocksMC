@@ -95,39 +95,47 @@ public final class AnvilWriter implements AutoCloseable {
     }
 
     /**
-     * Writes one chunk.
+     * Writes one chunk from already-serialised NBT.
      *
-     * <p>The NBT is re-serialised rather than passed through as stored bytes. Stored
-     * values are uncompressed NBT, so a byte-level pass-through would be possible and
-     * marginally faster, but going through {@code NbtIo} means the exporter fails on a
-     * malformed value here rather than writing it into a file a tool will later reject.
+     * <p>Takes bytes rather than an {@code NbtCompound} so a caller that needs the
+     * serialised form anyway -- to hash it for verification, say -- does not pay for
+     * serialising twice. An earlier version of this class serialised once to estimate
+     * the size and again to write, doubling the cost of the hot path.
      */
-    public void write(ChunkPos pos, NbtCompound nbt) throws IOException {
-        int before = sectorEstimate(nbt);
+    public void write(ChunkPos pos, byte[] nbtBytes) throws IOException {
         try (DataOutputStream out = this.regionFile.getChunkOutputStream(pos)) {
-            NbtIo.write(nbt, out);
+            out.write(nbtBytes);
         }
         this.chunksWritten++;
-        if (before >= EXTERNAL_SECTOR_THRESHOLD) {
+        if (sectorEstimate(nbtBytes.length) >= EXTERNAL_SECTOR_THRESHOLD) {
             this.externalChunks++;
         }
     }
 
-    /**
-     * A cheap upper bound on the sectors a chunk will occupy, for reporting only.
-     *
-     * <p>Estimated from the uncompressed size rather than measured after compression,
-     * because measuring would mean compressing twice. It therefore over-counts: a chunk
-     * reported as external may compress below the threshold. That is the safe direction
-     * for a warning, and the number is only used to tell an operator that oversized
-     * chunks are present at all.
-     */
-    private static int sectorEstimate(NbtCompound nbt) throws IOException {
+    /** Convenience for callers that hold NBT and do not need the bytes. */
+    public void write(ChunkPos pos, NbtCompound nbt) throws IOException {
+        write(pos, serialise(nbt));
+    }
+
+    /** Serialises NBT exactly as it is stored and written: uncompressed. */
+    public static byte[] serialise(NbtCompound nbt) throws IOException {
         java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream(64 * 1024);
         try (DataOutputStream out = new DataOutputStream(buffer)) {
             NbtIo.write(nbt, out);
         }
-        return (buffer.size() + 5 + SECTOR - 1) / SECTOR;
+        return buffer.toByteArray();
+    }
+
+    /**
+     * An upper bound on the sectors a chunk will occupy, for reporting only.
+     *
+     * <p>Computed from the uncompressed size, so it over-counts: a chunk reported as
+     * external may compress below the threshold. That is the safe direction for a
+     * warning whose only job is telling an operator oversized chunks are present, and
+     * measuring exactly would mean compressing twice.
+     */
+    private static int sectorEstimate(int uncompressedBytes) {
+        return (uncompressedBytes + 5 + SECTOR - 1) / SECTOR;
     }
 
     public int chunksWritten() {
